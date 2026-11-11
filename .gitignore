@@ -1,0 +1,12 @@
+# Bỏ qua thư mục cache của Python
+__pycache__/
+*.pyc
+
+# Bỏ qua dữ liệu người dùng
+user_data/
+
+# Bỏ qua mật khẩu / tài khoản bảo mật
+credentials.json
+
+# Bỏ qua tất cả các file có đuôi .md
+*.md
