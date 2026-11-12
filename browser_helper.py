@@ -647,17 +647,34 @@ class TikTokBrowserAutomation:
 
             # --- BƯỚC 6.4.4: Tick chọn checkbox sản phẩm kết quả ---
             print(f"   [+] Đang chọn checkbox cho SKU ID: {sku_id}")
-            # Tìm dòng chứa sku_id hoặc lấy trực tiếp checkbox đầu tiên của kết quả lọc chuẩn xác theo ID
-            row = page.locator(f"tr:has-text('{sku_id}')").first
-            if row.count() > 0 and row.is_visible():
-                checkbox_label = row.locator(".core-checkbox, label").first
-                checkbox_label.evaluate("el => el.click()")
-                print(f"   ✓ Đã tick chọn thành công SKU ID: {sku_id}")
+            if not sku_id.isdigit():
+                raise RuntimeError(f"SKU ID không hợp lệ: {sku_id!r}")
+            sku_checkbox_selector = f'input[type="checkbox"][value="{sku_id}"]'
+            sku_rows = page.locator("tr.core-table-tr:visible").filter(
+                has=page.locator(sku_checkbox_selector)
+            )
+            row = sku_rows.first
+            try:
+                row.wait_for(state="visible", timeout=10000)
+            except PWTimeout as exc:
+                raise RuntimeError(
+                    f"Không thấy dòng sản phẩm có checkbox value={sku_id}. "
+                    "Chưa chọn sản phẩm, chưa gửi lời mời. "
+                    "Kiểm tra lại kết quả tìm sản phẩm."
+                ) from exc
+            if sku_rows.count() == 1:
+                checkbox = row.locator(sku_checkbox_selector)
+                if checkbox.count() != 1 or checkbox.is_disabled():
+                    raise RuntimeError(f"Checkbox SKU {sku_id} không duy nhất hoặc bị vô hiệu hóa")
+                if not checkbox.is_checked():
+                    mask = checkbox.locator(
+                        'xpath=ancestor::label[@data-tid="m4b_checkbox"][1]'
+                    ).locator(".core-checkbox-mask")
+                    mask.click(timeout=5000)
+                from playwright.sync_api import expect
+                expect(checkbox).to_be_checked(timeout=5000)
             else:
-                # Fallback lấy checkbox đầu tiên trong bảng kết quả
-                fallback_cb = page.locator(".core-table-container .core-checkbox").first
-                fallback_cb.evaluate("el => el.click()")
-                print("   ⚠️ Đã tick chọn checkbox đầu tiên trên bảng.")
+                raise RuntimeError(f"Không xác định được duy nhất sản phẩm SKU {sku_id}")
                 
             print(f"   ✓ Đã tick chọn thành công SKU ID: {sku_id}")
             time.sleep(1)
@@ -806,36 +823,34 @@ class TikTokBrowserAutomation:
                 time.sleep(0.5)
 
             # ==========================================
-            # GIAI ĐOẠN 2: Tick chọn toàn bộ (click vào label, đọc trạng thái từ input)
+            # GIAI ĐOẠN 2: Chỉ tick/đếm các dòng khớp username của đợt.
             # ==========================================
-            print("\n   [+] Đã đưa tất cả creator xuống bảng. Đang tick chọn toàn bộ...")
+            print("\n   [+] Đang kiểm tra checkbox từng creator của đợt...")
             time.sleep(1.5)
 
-            table = page.locator(".core-table-container")
-            rows = table.locator("tbody tr")
-
-            # 1. Tick checkbox tổng ở tiêu đề (nếu chưa tick)
-            master_label = table.locator("th.core-table-checkbox label.core-checkbox").first
-            master_input = table.locator("th.core-table-checkbox input[type='checkbox']").first
-            if master_label.count() > 0 and not master_input.is_checked():
-                master_label.click()
-                time.sleep(1)
-
-            # 2. Kiểm tra từng dòng, dòng nào chưa tick thì click label của dòng đó
-            for i in range(rows.count()):
-                row = rows.nth(i)
-                row_input = row.locator("input[type='checkbox']").first
-                row_label = row.locator("label.core-checkbox").first
-                if row_input.count() > 0 and not row_input.is_checked():
-                    row_label.click()
-                    time.sleep(0.3)
-
-            # 3. Đếm số dòng thực sự đã tick
             added_count = 0
-            row_inputs = table.locator("tbody tr td input[type='checkbox']")
-            for i in range(row_inputs.count()):
-                if row_inputs.nth(i).is_checked():
-                    added_count += 1
+            normalized_usernames = [str(u).strip().lstrip("@").lower() for u in creator_usernames]
+            if len(set(normalized_usernames)) != len(normalized_usernames):
+                raise RuntimeError("Danh sách đợt chứa username trùng; chưa gửi.")
+            for username in normalized_usernames:
+                identity = page.get_by_text(
+                    re.compile(rf"^\s*@?{re.escape(username)}\s*$", re.IGNORECASE)
+                )
+                creator_rows = page.locator(".core-table-container tbody tr:visible").filter(
+                    has=identity
+                )
+                if creator_rows.count() != 1:
+                    raise RuntimeError(
+                        f"Creator {username}: tìm thấy {creator_rows.count()} dòng, cần đúng 1; chưa gửi."
+                    )
+                row = creator_rows.first
+                row_input = row.locator("input[type='checkbox']")
+                if row_input.count() != 1:
+                    raise RuntimeError(f"Không xác định được checkbox creator {username}; chưa gửi.")
+                if not row_input.is_checked():
+                    row.locator("label.core-checkbox").click()
+                expect(row_input).to_be_checked(timeout=5000)
+                added_count += 1
             time.sleep(1.5)
             print(f"\n✅ Đã hoàn tất cấu hình lời mời Đợt {batch_index} cho {added_count} creator.")
             if failed_creators:
@@ -846,25 +861,44 @@ class TikTokBrowserAutomation:
             print(f" ⚠️  KIỂM TRA LẠI THÔNG TIN BẢN NHÁP LỜI MỜI (ĐỢT {batch_index}):")
             print(f" - Tên lời mời: {invitation_name}")
             print(f" - SKU ID: {sku_id} ({sku_info.get('product')})")
-            print(f" - Số lượng creator thực tế thêm: {added_count -1}")
+            print(f" - Số lượng creator thực tế thêm: {added_count}")
+            print(f" - Số lượng yêu cầu trong đợt: {len(creator_usernames)}")
             print("=======================================================")
+
+            if failed_creators or added_count != len(creator_usernames) or added_count == 0:
+                raise RuntimeError(
+                    f"Đã chọn {added_count}/{len(creator_usernames)} creator; "
+                    f"thêm thất bại: {failed_creators}; chưa gửi."
+                )
             
             confirm = input(f"👉 Bạn có muốn GỬI lời mời Đợt {batch_index} này không? (y/n): ")
             if confirm.lower() == 'y':
+                success_message = page.get_by_text("Đã gửi lời mời cộng tác!", exact=True)
+                # Không nhận nhầm thông báo thành công còn lại từ đợt trước.
+                success_message.wait_for(state="hidden", timeout=3000)
                 page.locator("button:has-text('Gửi')").click(force=True)
-                time.sleep(2)
-                print(f"🚀 Đã bấm GỬI lời mời Đợt {batch_index} thành công!")
-                return True, invitation_name, added_count-1
+                print("Đã bấm Gửi, đang chờ TikTok xác nhận...")
+                try:
+                    success_message.wait_for(state="visible", timeout=30000)
+                except PWTimeout:
+                    print(
+                        "CHƯA XÁC NHẬN: không thấy thông báo gửi thành công. "
+                        "Không tự gửi lại; kiểm tra lịch sử trước khi tiếp tục."
+                    )
+                    return False, invitation_name, 0
+                print(f"✓ TikTok xác nhận đã gửi lời mời: {invitation_name}")
+                print(f"   Số creator đã chọn trước gửi: {added_count}")
+                return True, invitation_name, added_count
             else:
                 print(f"⏸ Hủy gửi Đợt {batch_index}. Lời mời được giữ ở dạng bản nháp.")
-                return False, invitation_name, added_count-1
+                return False, invitation_name, 0
 
         except Exception as e:
             print(f"❌ Lỗi trong quá trình tạo lời mời cộng tác Đợt {batch_index}: {e}")
             return False, None, 0
 
     def share_invitation_via_chat(self):
-        """Bấm 'Nhắn tin cho nhà sáng tạo', bấm 'Chia sẻ' và chờ TikTok gửi xong rồi mới đóng tab."""
+        """Chia sẻ lời mời; giữ tab đến khi người dùng xác minh gửi đủ."""
         page = self.page
 
         # 1. Bấm nút và bắt tab tin nhắn mới
@@ -892,12 +926,21 @@ class TikTokBrowserAutomation:
         # 4. Bấm "Chia sẻ"
         share_btn = chat_page.get_by_role("button", name=re.compile(r"^\s*Chia sẻ\s*$")).last
         share_btn.wait_for(state="visible", timeout=10000)
+        if input("Xác nhận GỬI qua chat cho các creator đang chọn? (y/n): ").strip().lower() != "y":
+            print("Không gửi qua chat; giữ tab để kiểm tra.")
+            return False
         share_btn.click()
 
-        # 5. Chờ popup đóng, tức là đã gửi xong, rồi mới đóng tab
-        popup_title.wait_for(state="hidden", timeout=180000)
-        chat_page.wait_for_load_state("networkidle", timeout=30000)
-        time.sleep(3)
-
+        # Popup đóng/networkidle không chứng minh hàng đợi gửi đã hoàn tất.
+        print("   [+] Đã bấm Chia sẻ. Giữ tab chat mở, chưa xác nhận gửi đủ.")
+        print("   Kiểm tra từng người nhận và các cảnh báo giới hạn/lỗi trên TikTok.")
+        completed = input(
+            "Chỉ khi đã xác minh gửi đủ người nhận, nhập 'DA GUI DU' để đóng tab "
+            "và tiếp tục. Nếu thiếu/chưa rõ, nhấn Enter để giữ tab và dừng: "
+        ).strip()
+        if completed != "DA GUI DU":
+            print("   ⚠ Chưa xác nhận gửi đủ. Giữ tab chat; không tự gửi lại.")
+            return False
         chat_page.close()
-        print("   ✓ Đã gửi lời mời qua chat và đóng tab tin nhắn.")
+        print("   ✓ Người dùng đã xác minh gửi đủ; đã đóng tab chat.")
+        return True

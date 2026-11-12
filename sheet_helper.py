@@ -213,25 +213,31 @@ class GoogleSheetManager:
 
     def validate_creator(self, creator, sku):
         """Đối chiếu creator với tiêu chí SKU. Trả về (ok, [lý do loại]).
-        Chỉ loại khi đọc được số liệu tương ứng và số liệu không đạt."""
+        Loại khi thiếu số liệu bắt buộc hoặc số liệu không đạt."""
         reasons = []
 
         fmin, fmax = self.parse_follower_rule(sku.get("followers_rule", ""))
         if fmin is not None:
             fv = self.parse_compact_number(creator.get("followers"))
-            if fv is not None and not (fmin <= fv <= fmax):
+            if fv is None:
+                reasons.append("thiếu dữ liệu followers bắt buộc")
+            elif not (fmin <= fv <= fmax):
                 reasons.append(f"followers {fv} ngoài khoảng {fmin}-{fmax}")
 
         omin = self.parse_min_rule(sku.get("orders_rule", ""))
         if omin is not None:
             ov = self.parse_compact_number(creator.get("orders"))
-            if ov is not None and ov <= omin:
+            if ov is None:
+                reasons.append("thiếu dữ liệu số món bắt buộc")
+            elif ov <= omin:
                 reasons.append(f"số món {ov} <= {omin}")
 
         gmin = self.parse_min_rule(sku.get("gmv_rule", ""))
         if gmin is not None:
             gv = self.parse_compact_number(creator.get("gmv"))
-            if gv is not None and gv <= gmin:
+            if gv is None:
+                reasons.append("thiếu dữ liệu GMV bắt buộc")
+            elif gv <= gmin:
                 reasons.append(f"GMV {gv} <= {gmin}")
 
         return (len(reasons) == 0), reasons
@@ -305,9 +311,29 @@ class GoogleSheetManager:
                     today.strftime("%d/%m/%Y"),         # D: Ngày gửi
                     expiry.strftime("%d/%m/%Y"),        # E: Có hiệu lực đến
                     total_follow,                       # F: Follow-up đã gửi
-                    today.strftime("%d/%m/%Y"),        # G: Ngày follow-up
+                    today.strftime("%d/%m/%Y") if total_follow else "",  # G
                 ],
                 value_input_option="USER_ENTERED",
             )
         except Exception as e:
             print(f"     ⚠️ Không ghi được lịch sử lên Google Sheet: {e}")
+            raise
+
+    def update_followup_history(self, invitation_name, total_follow):
+        """Cập nhật F-G của duy nhất dòng khớp tên lời mời, giữ nguyên A-E."""
+        ws = self.spreadsheet.worksheet("THEO DÕI LỜI MỜI")
+        matching_rows = [
+            row for row, name in enumerate(ws.col_values(2), start=1)
+            if name.strip() == invitation_name
+        ]
+        if len(matching_rows) != 1:
+            raise RuntimeError(
+                f"Lời mời '{invitation_name}' có {len(matching_rows)} dòng lịch sử; "
+                "không cập nhật follow-up để tránh sửa nhầm."
+            )
+        row = matching_rows[0]
+        ws.update(
+            range_name=f"F{row}:G{row}",
+            values=[[total_follow, datetime.datetime.now().strftime("%d/%m/%Y")]],
+            value_input_option="USER_ENTERED",
+        )

@@ -63,7 +63,7 @@ def main():
             bot.reset_filters()
             for cat in sku["categories"]:
                 if not bot.apply_category_filter(cat):
-                    print(f"   -> Bỏ qua hạng mục chưa chọn được: {cat}")
+                    print(f"   -> Bỏ qua hạng mục không tìm thấy: {cat}")
 
             # Bộ lọc followers đọc từ 'YÊU CẦU FOLLOWERS' (vd '1000<Followers<30000')
             fmin, fmax = sheet_mgr.parse_follower_rule(sku["followers_rule"])
@@ -144,19 +144,26 @@ def main():
                     ######################################################################
                     # GỬI TIN NHẮN CHO CREATOR
                     ######################################################################
+                    if not success:
+                        raise RuntimeError(
+                            f"Đợt {batch_index} chưa xác minh gửi thành công. "
+                            "Dừng tại đây; kiểm tra bản nháp/lịch sử trước khi chạy lại."
+                        )
+
+                    # Ghi lời mời đã xác minh trước, không phụ thuộc kết quả chat.
+                    sheet_mgr.log_invitation_history(
+                        invitation_name=inv_name,
+                        total_creators=total_sent,
+                        total_follow=0,
+                    )
                     try:
-                        # bot.go_to_target_collaboration()
-                        bot.share_invitation_via_chat()
-                        if success:
-                            # Ghi lịch sử gửi vào tab 'THEO DÕI LỜI MỜI'[cite: 2]
-                            sheet_mgr.log_invitation_history(
-                                invitation_name=inv_name,
-                                total_creators=total_sent,
-                                total_follow=total_sent
-                            )
-                        print(f"   ✓ Đã ghi nhận lịch sử đợt {batch_index} vào Sheet.")
+                        if not bot.share_invitation_via_chat():
+                            raise RuntimeError("Chat chưa xác nhận gửi đủ; giữ trạng thái để kiểm tra.")
                     except Exception as e:
                         print(f"   ⚠️ Không chia sẻ được lời mời '{inv_name}' qua chat: {e}")
+                        raise
+                    sheet_mgr.update_followup_history(inv_name, total_sent)
+                    print(f"   ✓ Follow-up '{inv_name}': {total_sent} creator (gán theo tổng đã mời).")
 
             else:
                 print(f"⚠️ SKU '{product}' không có creator nào đạt điều kiện để tạo lời mời.")
