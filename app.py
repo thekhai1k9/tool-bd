@@ -62,14 +62,16 @@ def main():
             # Bộ lọc hạng mục đọc từ cột 'NGÀNH HÀNG / HẠNG MỤC KOL/KOC'
             bot.reset_filters()
             for cat in sku["categories"]:
-                bot.apply_category_filter(cat)
+                if not bot.apply_category_filter(cat):
+                    print(f"   -> Bỏ qua hạng mục chưa chọn được: {cat}")
 
             # Bộ lọc followers đọc từ 'YÊU CẦU FOLLOWERS' (vd '1000<Followers<30000')
             fmin, fmax = sheet_mgr.parse_follower_rule(sku["followers_rule"])
             if fmin is not None:
-                bot.apply_follower_filter(fmin, fmax)
-            else:
-                print("   -> Không có rule followers, bỏ qua lọc follower.")
+                if not bot.apply_follower_filter(fmin, fmax):
+                    raise RuntimeError("Chưa áp dụng được bộ lọc followers")
+
+
 
             sku_count = 0
             creators_for_this_sku = [] # Mảng lưu creator trong RAM

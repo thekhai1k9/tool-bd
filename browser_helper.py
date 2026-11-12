@@ -154,29 +154,33 @@ class TikTokBrowserAutomation:
                     if not el.is_visible():
                         continue
                     txt = re.sub(r"\s*\(\d+\)\s*$", "", el.inner_text().strip()).lower()
-                    if text.strip().lower() not in txt:
+                    if text.strip().lower() != txt:
                         continue
 
-                    # Lấy container (label / item row) chứa text này
-                    container = el.evaluate_handle(
-                        "e => e.closest('label') || e.closest('[class*=\"item\"]') || e.closest('[role=\"option\"]') || e.parentElement"
-                    ).as_element()
-                    if container is None:
+                    # Text có thể nằm trong span, checkbox nằm ở nhánh bên cạnh.
+                    container = el.locator(
+                        "xpath=ancestor-or-self::*[.//input[@type='checkbox'] "
+                        "or .//*[@role='checkbox']][1]"
+                    )
+                    if container.count() == 0:
                         continue
 
-                    # Tìm checkbox trong container
-                    cb = container.query_selector('input[type="checkbox"]')
-                    if cb is not None:
-                        if not cb.is_checked():
-                            cb.check()
-                            time.sleep(0.5)
+                    cb = container.locator('input[type="checkbox"]')
+                    if cb.count() == 0:
+                        cb = container.get_by_role("checkbox")
+                    if cb.count() != 1:
+                        continue
+                    if not cb.is_checked():
+                        if cb.is_visible():
+                            cb.set_checked(True, timeout=2000)
+                        else:
+                            # TikTok dùng input ẩn; click input để phát sự kiện cho UI.
+                            cb.evaluate("e => { if (!e.disabled && !e.checked) e.click(); }")
+                        self.page.wait_for_timeout(300)
+                    if cb.is_checked():
                         return True
-
-                    # Không có input[type=checkbox]: thử click chính container (thường là label)
-                    container.click()
-                    time.sleep(0.5)
-                    return True
-                except Exception:
+                except Exception as e:
+                    print(f"   [DEBUG] Không tick được checkbox '{text}': {e}")
                     continue
             time.sleep(0.5)
         return False
@@ -186,7 +190,13 @@ class TikTokBrowserAutomation:
         Trả về True nếu chọn được, False nếu bỏ qua."""
         try:
             self.close_dropdown()
-            self.open_tab("Nhà sáng tạo")
+            category_filters = self.page.get_by_text("Hạng mục sản phẩm", exact=True)
+            # Chọn hạng mục tiếp theo trên tab hiện tại, giữ các lựa chọn trước.
+            if not any(
+                category_filters.nth(i).is_visible()
+                for i in range(category_filters.count())
+            ):
+                self.open_tab("Nhà sáng tạo")
             self.click_visible("Hạng mục sản phẩm", force=True)
             time.sleep(1)
 
@@ -227,71 +237,61 @@ class TikTokBrowserAutomation:
         Tìm các khoảng có sẵn trên UI và tick những khoảng giao với [min, max].
         Trả về True nếu tick được ít nhất 1 khoảng."""
         try:
-            self.close_dropdown()
             self.open_tab("Người theo dõi")
-            time.sleep(1)
+            self.click_visible("Tổng số người theo dõi")
 
-            # Lấy tất cả text trong tab hiện tại để nhận diện các khoảng follower
-            # Các label phổ biến: "1.000 - 10.000", "10.000 - 30.000", "Dưới 1.000", "Trên 30.000"...
-            range_re = re.compile(
-                r"(\d[\d.,]*)\s*[-–]\s*(\d[\d.,]*)"
-                r"|(dưới|nhỏ hơn|under|less than)\s*(\d[\d.,]*)"
-                r"|(trên|lớn hơn|hơn|over|more than)\s*(\d[\d.,]*)",
-                re.IGNORECASE,
+            # Nhận diện popup qua slider thực tế, không phụ thuộc class CSS.
+            slider = self.page.locator('[data-tid="m4b_slider"]:visible')
+            slider.wait_for(state="visible", timeout=10000)
+            popup = slider.locator(
+                "xpath=ancestor::*[count(.//input)=2][1]"
             )
+            popup.wait_for(state="visible", timeout=5000)
 
-            def parse_num(s):
-                if not s:
-                    return None
-                s = s.replace(",", "").replace(".", "")
-                digits = re.sub(r"\D", "", s)
-                return int(digits) if digits else None
+            inputs = popup.locator('input:visible')
+            if inputs.count() != 2:
+                raise RuntimeError(
+                    f"Cần 2 ô min/max, tìm thấy {inputs.count()}"
+                )
 
-            # Tìm tất cả các element có khả năng là option (label chứa text có số)
-            options = self.page.locator('label, [class*="item"], [role="option"]').all()
-            ticked = 0
-            for opt in options:
-                try:
-                    if not opt.is_visible():
-                        continue
-                    txt = opt.inner_text().strip()
-                    m = range_re.search(txt)
-                    if not m:
-                        continue
+            min_input = inputs.nth(0)
+            max_input = inputs.nth(1)
 
-                    lo, hi = None, None
-                    if m.group(1) and m.group(2):
-                        lo, hi = parse_num(m.group(1)), parse_num(m.group(2))
-                    elif m.group(3) and m.group(4):
-                        hi = parse_num(m.group(4))
-                        lo = 0
-                    elif m.group(5) and m.group(6):
-                        lo = parse_num(m.group(6))
-                        hi = 10**12
+            # Nhập max trước để không bị ràng buộc bởi max cũ.
+            max_input.fill(str(max_followers))
+            max_input.press("Tab")
 
-                    # Chỉ tick nếu khoảng này giao với [min_followers, max_followers]
-                    if lo is not None and hi is not None and lo <= max_followers and hi >= min_followers:
-                        cb = opt.query_selector('input[type="checkbox"]')
-                        if cb is not None:
-                            if not cb.is_checked():
-                                cb.check()
-                                time.sleep(0.3)
-                        else:
-                            opt.click()
-                            time.sleep(0.3)
-                        ticked += 1
-                        print(f"   ✓ Tick khoảng follower: {txt}")
-                except Exception:
-                    continue
+            min_input.fill(str(min_followers))
+            min_input.press("Tab")
 
-            if ticked == 0:
-                print(f"   ⚠ Không nhận diện được khoảng follower nào, bỏ qua lọc follower.")
-                return False
+            def read_number(field):
+                return re.sub(r"\D", "", field.input_value())
 
-            time.sleep(1)
+            # Chờ giao diện nhận giá trị và định dạng lại.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if (
+                    read_number(min_input) == str(min_followers)
+                    and read_number(max_input) == str(max_followers)
+                ):
+                    break
+                time.sleep(0.2)
+            else:
+                raise RuntimeError(
+                    f"Giá trị sau nhập: "
+                    f"{min_input.input_value()} - "
+                    f"{max_input.input_value()}"
+                )
+
+            self.close_dropdown()
+            print(
+                f"   ✓ Đã nhập followers: "
+                f"{min_followers} - {max_followers}"
+            )
             return True
+
         except Exception as e:
-            print(f"   ⚠ Lỗi khi lọc follower: {e}")
+            print(f"   ❌ Lọc followers thất bại: {e}")
             return False
 
     # ------------------------------------------------------------------ #
