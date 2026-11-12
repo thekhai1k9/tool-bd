@@ -4,10 +4,8 @@ import re
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from urllib.parse import urlparse, parse_qs
 import time
-from playwright.sync_api import TimeoutError as PWTimeout
-
-# Trang "Tìm nhà sáng tạo" (copy đúng URL từ thanh địa chỉ khi bạn đang ở trang đó)
-SEARCH_PAGE_URL = "https://affiliate.tiktok.com/affiliate/creator"
+import diagnostics
+from config import SEARCH_PAGE_URL
 
 SEARCH_SEL = 'input[data-tid="m4b_input_search"]'
 CREATOR_ROW_SEL = '[class*="wrapper-row__StyledTr"]'
@@ -143,6 +141,7 @@ class TikTokBrowserAutomation:
         except PWTimeout:
             print("   -> Nút Đặt lại đang tắt, không có bộ lọc nào cần xóa.")
         except Exception as e:
+            diagnostics.capture_error(self.page, e)
             print(f"   -> Bỏ qua Đặt lại: {e}")
 
     def _tick_option_by_text(self, text, timeout=10):
@@ -228,6 +227,7 @@ class TikTokBrowserAutomation:
             time.sleep(1)
             return True
         except Exception as e:
+            diagnostics.capture_error(self.page, e)
             print(f"   ⚠ Lỗi khi lọc hạng mục '{category_name}': {e}")
             try:
                 self.page.keyboard.press("Escape")
@@ -294,6 +294,7 @@ class TikTokBrowserAutomation:
             return True
 
         except Exception as e:
+            diagnostics.capture_error(self.page, e)
             print(f"   ❌ Lọc followers thất bại: {e}")
             return False
 
@@ -617,6 +618,7 @@ class TikTokBrowserAutomation:
     def go_to_target_collaboration(self):
         """Lưu URL danh sách lần đầu; quay thẳng về đó sau trang gửi thành công."""
         print("\n👉 Đang chuyển sang trang 'Cộng tác mục tiêu'...")
+        diagnostics.set_context(stage="target_navigation", creator=None, keyword=None)
         try:
             page = self.page
             source_shop_id = parse_qs(urlparse(page.url).query).get("shop_id", [None])[0]
@@ -645,6 +647,7 @@ class TikTokBrowserAutomation:
             print("   ✓ Đã vào trang Cộng tác mục tiêu.")
             return True
         except Exception as e:
+            diagnostics.capture_error(self.page, e)
             self.target_collaboration_url = None
             print(f"   ❌ Lỗi khi điều hướng vào Cộng tác mục tiêu: {e}")
             return False
@@ -795,6 +798,8 @@ class TikTokBrowserAutomation:
         return len(expected)
 
     def _record_invitation_state(self, callback, status, stage, **details):
+        diagnostics.set_context(stage=stage)
+        diagnostics.event(f"Invitation state: status={status}, stage={stage}")
         self.last_invitation_state = {
             **getattr(self, "last_invitation_state", {}),
             "status": status, "stage": stage, "error": None, **details,
@@ -821,11 +826,355 @@ class TikTokBrowserAutomation:
             self._record_invitation_state(
                 on_state_change, "sending", "verify_send", error="Không thấy thông báo gửi thành công trong 30 giây."
             )
+            diagnostics.capture_error(self.page)
             print("CHƯA XÁC NHẬN sau thao tác Gửi. Giữ trạng thái sending; không tự gửi lại.")
             return False, invitation_name, 0
         self._record_invitation_state(on_state_change, "sent", "log_history", total_sent=added_count)
         print(f"✓ TikTok xác nhận đã gửi lời mời: {invitation_name}")
         return True, invitation_name, added_count
+
+    def _configure_invitation_details(self, sku_info, invite_content, batch_index, attempt, on_state_change):
+        page = self.page
+        # 1. Bấm nút 'Mời cộng tác' góc trên phải
+        print("👉 Bấm 'Mời cộng tác'...")
+        page.locator("button:has-text('Mời cộng tác')").first.click(force=True)
+        time.sleep(2)
+
+        ##########################################################################
+        # 2. Tạo tên lời mời chuẩn dạng: BD_AUTO_[4 số đuôi ID SKU]-[NGÀY/THÁNG]_[ĐỢT] (VD: BD_AUTO_3257-07/11_1)[cite: 2, 3]
+        ##########################################################################
+        sku_id = str(sku_info.get("sku_id", ""))
+        suffix_4_digits = sku_id[-4:] if len(sku_id) >= 4 else sku_id
+        today_str = datetime.datetime.now().strftime("%d/%m")
+        invitation_name = f"BD_AUTO_{suffix_4_digits}-{today_str}_{batch_index}"
+        if attempt > 1:
+            invitation_name += f"_R{attempt}"
+        self._record_invitation_state(on_state_change, "draft", "configure_invitation", invitation_name=invitation_name)
+
+        print(f"   [+] Tên lời mời: {invitation_name}")
+
+        # Điền tên lời mời
+        page.get_by_placeholder("Tên lời mời").fill(invitation_name, force=True)
+        time.sleep(0.5)
+
+        ######################################################################
+        # 3. Chọn ngày kết thúc hiệu lực = hôm nay + 30 ngày
+        ######################################################################
+        print("   [+] Thiết lập thời hạn hiệu lực...")
+        target = datetime.datetime.now() + datetime.timedelta(days=30)
+
+        date_input = page.locator("input.core-picker-start-time[placeholder='Ngày kết thúc']")
+        date_input.click(force=True)
+
+        # Nhãn "01 / 2026" và popup lịch
+        header_value = page.locator("div.core-picker-header-value").first
+        header_value.wait_for(state="visible", timeout=5000)
+        panel = page.locator("div.core-panel-date:visible").first
+
+        # Nút ‹ nằm ngay trước nhãn, › nằm ngay sau nhãn
+        prev_btn = header_value.locator("xpath=preceding-sibling::div[contains(@class,'core-picker-header-icon')][1]")
+        next_btn = header_value.locator("xpath=following-sibling::div[contains(@class,'core-picker-header-icon')][1]")
+
+        # Bấm cho đến khi popup hiển thị đúng tháng và năm
+        for _ in range(24):
+            m, y = map(int, re.findall(r"\d+", header_value.inner_text()))
+            if (y, m) == (target.year, target.month):
+                break
+            if (y, m) < (target.year, target.month):
+                next_btn.click()
+            else:
+                prev_btn.click()
+            time.sleep(0.3)
+
+        # Chọn ô ngày trong phần thân lịch (không lấy ô của tháng khác nếu có thể)
+        body = panel.locator("div.core-picker-body")
+        body.get_by_text(str(target.day), exact=True).first.click()
+        time.sleep(0.5)
+
+        # Xác nhận đã điền
+        value = date_input.input_value()
+        if value:
+            print(f"     [✓] Hiệu lực đến: {value}")
+        else:
+            print("     ⚠️ Ô ngày vẫn trống, kiểm tra lại selector ô ngày.")
+
+        # (Lưu ý: Số Zalo trên app đã tự động có sẵn)
+
+        # 4. Điền nội dung lời mời
+        if invite_content:
+            msg_input = page.get_by_placeholder("Nhập nội dung lời mời")
+            if msg_input.is_visible():
+                msg_input.fill(invite_content, force=True)
+
+        # 5 . Loại nội dung ưu tiên: Không có ưu tiên (Mặc định)[cite: 2]
+        return invitation_name, sku_id
+
+    def _configure_invitation_product(self, sku_id, sku_info, on_state_change):
+        page = self.page
+        # 6. Chọn sản phẩm (SKU)
+        print("   [+] Chuyển chế độ tìm kiếm sang 'ID sản phẩm'...")
+        self._record_invitation_state(on_state_change, "draft", "select_product")
+
+        # ----- Bước 6.1: Bấm vào thanh tiêu đề "Chọn sản phẩm" để xổ mục xuống (nếu đang đóng)
+        section_header = page.locator("text=Chọn sản phẩm").first
+        section_header.scroll_into_view_if_needed()
+        section_header.click(force=True)
+        time.sleep(1)
+
+        # ---- Bước 6.2: Bấm nút 'Thêm sản phẩm' màu xanh để trượt panel bên phải ra
+        print("   [+] Bấm 'Thêm sản phẩm' để mở bảng chọn...")
+        add_product_btn = page.locator("button:has-text('Thêm sản phẩm')").first
+        add_product_btn.scroll_into_view_if_needed()
+        add_product_btn.click(force=True)
+        time.sleep(1.5) # Chờ panel bên phải trượt ra hoàn toàn
+
+        # --- BƯỚC 6.3: Tương tác với Panel "Thêm từ cửa hàng" bên phải ---
+        print(f"   [+] Đang tìm và nhập SKU ID: {sku_id}")
+
+        # ---- BƯỚC 6.4.1: Ô tìm kiếm sản phẩm trong panel --> Đổi loại tìm kiếm thành "ID sản phẩm" ---
+        dropdown_trigger = page.locator("span.core-trigger, [class*='core-trigger'], .core-select").filter(has_text="Tên sản phẩm").first
+        if dropdown_trigger.count() == 0:
+            dropdown_trigger = page.locator("text=Tên sản phẩm").first
+
+        dropdown_trigger.click(force=True)
+        time.sleep(0.8)
+
+        # ---- BƯỚC 6.4.2: Chọn "ID sản phẩm" trong menu dropdown
+        option_id = page.locator(".core-select-option").filter(has_text="ID sản phẩm").first
+        option_id.click(force=True)
+        time.sleep(0.5)
+        print(f"   ✓ Đã chuyển sang chế độ ID sản phẩm thành công.")
+
+        # --- BƯỚC 6.4.3: Nhập SKU ID vào ô tìm kiếm ---
+        print(f"   [+] Nhập SKU ID vào ô tìm kiếm: {sku_id}")
+        search_input = page.locator(".core-drawer-body input[data-tid='m4b_input_search'], input[data-tid='m4b_input_search']").first
+
+        search_input.wait_for(state="visible", timeout=5000)
+        time.sleep(0.5)
+
+        search_input.scroll_into_view_if_needed()
+        search_input.click(force=True)
+        search_input.fill("")
+        time.sleep(0.3)
+
+        search_input.type(str(sku_id), delay=60)
+        time.sleep(0.3)
+        page.keyboard.press("Enter")
+
+        print(f"   ✓ Đã điền xong SKU ID: {sku_id}, đang chờ kết quả lọc...")
+        time.sleep(3.0) # Chờ hệ thống TikTok Shop load kết quả lọc theo ID
+
+        # --- BƯỚC 6.4.4: Tick chọn checkbox sản phẩm kết quả ---
+        print(f"   [+] Đang chọn checkbox cho SKU ID: {sku_id}")
+        if not sku_id.isdigit():
+            raise RuntimeError(f"SKU ID không hợp lệ: {sku_id!r}")
+        sku_checkbox_selector = f'input[type="checkbox"][value="{sku_id}"]'
+        sku_rows = page.locator("tr.core-table-tr:visible").filter(
+            has=page.locator(sku_checkbox_selector)
+        )
+        row = sku_rows.first
+        try:
+            row.wait_for(state="visible", timeout=10000)
+        except PWTimeout as exc:
+            raise RuntimeError(
+                f"Không thấy dòng sản phẩm có checkbox value={sku_id}. "
+                "Chưa chọn sản phẩm, chưa gửi lời mời. "
+                "Kiểm tra lại kết quả tìm sản phẩm."
+            ) from exc
+        if sku_rows.count() == 1:
+            checkbox = row.locator(sku_checkbox_selector)
+            if checkbox.count() != 1 or checkbox.is_disabled():
+                raise RuntimeError(f"Checkbox SKU {sku_id} không duy nhất hoặc bị vô hiệu hóa")
+            if not checkbox.is_checked():
+                mask = checkbox.locator(
+                    'xpath=ancestor::label[@data-tid="m4b_checkbox"][1]'
+                ).locator(".core-checkbox-mask")
+                mask.click(timeout=5000)
+            from playwright.sync_api import expect
+            expect(checkbox).to_be_checked(timeout=5000)
+        else:
+            raise RuntimeError(f"Không xác định được duy nhất sản phẩm SKU {sku_id}")
+
+        print(f"   ✓ Đã tick chọn thành công SKU ID: {sku_id}")
+        time.sleep(1)
+
+        # ---- BƯỚC 6.4.5: Bấm nút Xác nhận / Thêm ở góc dưới panel bên phải để hoàn tất chọn sản phẩm
+        print("   [+] Xác nhận thêm sản phẩm vào lời mời...")
+        confirm_btn = page.locator(".core-drawer-footer button:has-text('Thêm'), button:has-text('Thêm')").last
+        confirm_btn.scroll_into_view_if_needed()
+        if confirm_btn.is_visible():
+            confirm_btn.click(force=True)
+            print("   ✓ Đã bấm nút 'Thêm' thành công.")
+        else:
+            # Fallback bấm nút có thể đang sáng ở footer
+            page.locator(".core-drawer-footer button").last.click(force=True)
+
+        time.sleep(1.5)
+
+        #   BƯỚC 6.4.6: Bật switch "Hoa hồng Quảng cáo cửa hàng" và nhập tỉ lệ hoa hồng
+        print("   [+] Đang cấu hình tỉ lệ hoa hồng...")
+        def _fmt_rate(v):
+            # "15%" -> "15", 0.15 -> "15"
+            s = str(v).strip().replace('%', '').replace(',', '.')
+            try:
+                n = float(s)
+            except ValueError:
+                return ''
+            if n <= 1:
+                n *= 100
+            return f"{n:g}"
+        std_rate = _fmt_rate(sku_info.get('base_commission', ''))
+        ads_rate = _fmt_rate(sku_info.get('ads_commission', ''))
+
+        prod_row = page.locator(".core-table-container tbody tr").first
+        prod_row.wait_for(state="visible", timeout=5000)
+
+        ads_switch = prod_row.locator(".core-switch").first
+        ads_switch.scroll_into_view_if_needed()
+        if ads_switch.get_attribute("aria-checked") != "true":
+            ads_switch.click(force=True)
+            time.sleep(0.8)
+
+        rate_inputs = prod_row.locator("input[placeholder*='1,00-80,00']")
+
+        std_input = rate_inputs.nth(0)
+        std_input.click(force=True)
+        std_input.fill(std_rate)
+        time.sleep(0.3)
+
+        ads_input = rate_inputs.nth(1)
+        ads_input.click(force=True)
+        ads_input.fill(ads_rate)
+        time.sleep(0.5)
+
+        print(f"   ✓ Tỉ lệ tiêu chuẩn: {std_input.input_value()}% | Tỉ lệ quảng cáo: {ads_input.input_value()}%")
+
+
+        #####################################################################################
+        # 6. Cài đặt Hàng mẫu (Bật cung cấp hàng mẫu & chọn cài đặt cấp sản phẩm)[cite: 2, 6]
+        #####################################################################################
+
+    def _configure_invitation_samples(self):
+        page = self.page
+        print("   [+] Cấu hình hàng mẫu miễn phí cấp sản phẩm...")
+        sample_header = page.locator("text=Cài đặt hàng mẫu miễn phí").first
+        if sample_header.count() > 0:
+            sample_header.evaluate("el => el.click()")
+            time.sleep(0.8) # Chờ hiệu ứng trượt mở của giao diện TikTok Shop
+
+        # 2. Click chọn "Sử dụng cài đặt hàng mẫu cấp sản phẩm" bên trong
+        sample_option = page.locator("text=Sử dụng cài đặt hàng mẫu cấp sản phẩm").first
+        if sample_option.count() > 0:
+            sample_option.evaluate("el => el.click()")
+            print("   ✓ Đã chọn 'Sử dụng cài đặt hàng mẫu cấp sản phẩm' thành công.")
+        else:
+            print("   ✓ Khối cài đặt đã mở sẵn, tiếp tục...")
+
+        # --- THÊM CREATOR VÀO LỜI MỜI (CHO ĐỢT NÀY) ---
+
+    def _add_invitation_creators(self, creator_usernames, batch_index, on_state_change):
+        page = self.page
+        print(f"\n👉 Đang thêm {len(creator_usernames)} nhà sáng tạo vào Đợt {batch_index}...")
+        self._record_invitation_state(on_state_change, "draft", "add_creators")
+        creator_header = page.locator("text=Chọn nhà sáng tạo").first
+        if creator_header.count() > 0:
+            creator_header.evaluate("el => el.click()")
+            time.sleep(1.0)
+
+
+                    # ==========================================
+        # GIAI ĐOẠN 1: Gõ tìm và đưa từng creator xuống bảng
+        # ==========================================
+        self._record_invitation_state(on_state_change, "draft", "set_creator_page_size")
+        page_size_ready = self._set_creator_page_size(required=False)
+        self._record_invitation_state(on_state_change, "draft", "add_creators")
+        failed_creators = []
+        for username in creator_usernames:
+            username = str(username).strip()
+            diagnostics.set_context(creator=username)
+            search_creator = page.get_by_placeholder("Tìm kiếm nhà sáng tạo theo tên người dùng hoặc ID người dùng")
+            search_creator.wait_for(state="visible", timeout=5000)
+
+            # Khớp chính xác theo từ, không phân biệt hoa thường
+            exact = re.compile(rf"(?<![\w.]){re.escape(username)}(?![\w.])", re.IGNORECASE)
+            added_ok = False
+
+            for attempt in range(1, 4):
+                # 1. Đóng popup cũ, focus và xóa sạch ô input
+                page.keyboard.press("Escape")
+                search_creator.click()
+                search_creator.fill("")
+                time.sleep(0.3)
+
+                # 2. Gõ từng ký tự để kích hoạt API
+                search_creator.press_sequentially(username, delay=120)
+                print(f"     [+] Lần {attempt}: đang tìm '{username}'")
+
+                # 3. Chờ popup có mục khớp đúng username (thay cho sleep cố định)
+                items = page.locator("div[role='listitem'].arco-list-item, .m4b-list-item")
+                target = None
+                deadline = time.time() + 6
+                while time.time() < deadline and target is None:
+                    for i in range(items.count()):
+                        it = items.nth(i)
+                        try:
+                            if exact.search(it.inner_text(timeout=500)):
+                                target = it
+                                break
+                        except Exception:
+                            continue
+                    if target is None:
+                        time.sleep(0.3)
+
+                if target is None:
+                    print(f"     ⚠️ Không thấy '{username}' trong popup, thử lại...")
+                    continue
+
+                # 4. Click thật, không dùng JS click
+                target.click()
+
+                # 5. Xác minh username đã xuất hiện trong bảng
+                try:
+                    page.locator(".core-table-container").get_by_text(exact).first.wait_for(
+                        state="visible", timeout=5000
+                    )
+                    print(f"     [✓] Đã đưa creator '{username}' xuống bảng.")
+                    if not page_size_ready:
+                        self._record_invitation_state(on_state_change, "draft", "set_creator_page_size")
+                        page_size_ready = self._set_creator_page_size(required=True)
+                        self._record_invitation_state(on_state_change, "draft", "add_creators")
+                    added_ok = True
+                    break
+                except PWTimeout:
+                    print(f"     ⚠️ Chưa thấy '{username}' trong bảng, thử lại...")
+
+            if not added_ok:
+                print(f"     ❌ Không thêm được creator '{username}' sau 3 lần.")
+                failed_creators.append(username)
+
+            # Dọn popup trước khi sang creator tiếp theo
+            page.keyboard.press("Escape")
+            time.sleep(0.5)
+
+        # ==========================================
+        # GIAI ĐOẠN 2: Tối đa 50 người trên một trang, tick tổng một lần.
+        # ==========================================
+        return failed_creators
+
+    def _select_invitation_creators(self, creator_usernames, batch_index, failed_creators, on_state_change):
+        page = self.page
+        print("\n   [+] Đang tick checkbox tổng trên một trang 50/Trang...")
+        diagnostics.set_context(creator=None)
+        self._record_invitation_state(on_state_change, "draft", "select_creators")
+        time.sleep(1.5)
+        if failed_creators:
+            raise RuntimeError(f"Có creator chưa thêm được vào bảng: {failed_creators}; chưa gửi.")
+        added_count = self._select_all_invitation_creators(creator_usernames)
+        time.sleep(1.5)
+        print(f"\n✅ Đã hoàn tất cấu hình lời mời Đợt {batch_index} cho {added_count} creator.")
+        if failed_creators:
+            print(f"     ⚠️ Các creator không thêm được: {failed_creators}")
+        return added_count
 
     def create_target_invitation(self, sku_info, invite_content, creator_usernames, batch_index=1,
                                  on_state_change=None, attempt=1):
@@ -834,333 +1183,19 @@ class TikTokBrowserAutomation:
         """
         page = self.page
         self.last_invitation_state = {}
+        diagnostics.set_context(batch=batch_index, sku=sku_info.get("sku_id"), creator=None, keyword=None)
         try:
             self._record_invitation_state(on_state_change, "draft", "configure_invitation")
-            # 1. Bấm nút 'Mời cộng tác' góc trên phải
-            print("👉 Bấm 'Mời cộng tác'...")
-            page.locator("button:has-text('Mời cộng tác')").first.click(force=True)
-            time.sleep(2)
-
-            ##########################################################################
-            # 2. Tạo tên lời mời chuẩn dạng: BD_AUTO_[4 số đuôi ID SKU]-[NGÀY/THÁNG]_[ĐỢT] (VD: BD_AUTO_3257-07/11_1)[cite: 2, 3]
-            ##########################################################################
-            sku_id = str(sku_info.get("sku_id", ""))
-            suffix_4_digits = sku_id[-4:] if len(sku_id) >= 4 else sku_id
-            today_str = datetime.datetime.now().strftime("%d/%m")
-            invitation_name = f"BD_AUTO_{suffix_4_digits}-{today_str}_{batch_index}"
-            if attempt > 1:
-                invitation_name += f"_R{attempt}"
-            self._record_invitation_state(on_state_change, "draft", "configure_invitation", invitation_name=invitation_name)
-            
-            print(f"   [+] Tên lời mời: {invitation_name}")
-           
-            # Điền tên lời mời
-            page.get_by_placeholder("Tên lời mời").fill(invitation_name, force=True)
-            time.sleep(0.5)
-
-            ######################################################################
-            # 3. Chọn ngày kết thúc hiệu lực = hôm nay + 30 ngày
-            ######################################################################
-            print("   [+] Thiết lập thời hạn hiệu lực...")
-            target = datetime.datetime.now() + datetime.timedelta(days=30)
-
-            date_input = page.locator("input.core-picker-start-time[placeholder='Ngày kết thúc']")
-            date_input.click(force=True)
-
-            # Nhãn "01 / 2026" và popup lịch
-            header_value = page.locator("div.core-picker-header-value").first
-            header_value.wait_for(state="visible", timeout=5000)
-            panel = page.locator("div.core-panel-date:visible").first
-
-            # Nút ‹ nằm ngay trước nhãn, › nằm ngay sau nhãn
-            prev_btn = header_value.locator("xpath=preceding-sibling::div[contains(@class,'core-picker-header-icon')][1]")
-            next_btn = header_value.locator("xpath=following-sibling::div[contains(@class,'core-picker-header-icon')][1]")
-
-            # Bấm cho đến khi popup hiển thị đúng tháng và năm
-            for _ in range(24):
-                m, y = map(int, re.findall(r"\d+", header_value.inner_text()))
-                if (y, m) == (target.year, target.month):
-                    break
-                if (y, m) < (target.year, target.month):
-                    next_btn.click()
-                else:
-                    prev_btn.click()
-                time.sleep(0.3)
-
-            # Chọn ô ngày trong phần thân lịch (không lấy ô của tháng khác nếu có thể)
-            body = panel.locator("div.core-picker-body")
-            body.get_by_text(str(target.day), exact=True).first.click()
-            time.sleep(0.5)
-
-            # Xác nhận đã điền
-            value = date_input.input_value()
-            if value:
-                print(f"     [✓] Hiệu lực đến: {value}")
-            else:
-                print("     ⚠️ Ô ngày vẫn trống, kiểm tra lại selector ô ngày.")
-
-            # (Lưu ý: Số Zalo trên app đã tự động có sẵn)
-
-            # 4. Điền nội dung lời mời
-            if invite_content:
-                msg_input = page.get_by_placeholder("Nhập nội dung lời mời")
-                if msg_input.is_visible():
-                    msg_input.fill(invite_content, force=True)
-
-            # 5 . Loại nội dung ưu tiên: Không có ưu tiên (Mặc định)[cite: 2]
-
-            # 6. Chọn sản phẩm (SKU)
-            print("   [+] Chuyển chế độ tìm kiếm sang 'ID sản phẩm'...")
-            self._record_invitation_state(on_state_change, "draft", "select_product")
-            
-            # ----- Bước 6.1: Bấm vào thanh tiêu đề "Chọn sản phẩm" để xổ mục xuống (nếu đang đóng)
-            section_header = page.locator("text=Chọn sản phẩm").first
-            section_header.scroll_into_view_if_needed()
-            section_header.click(force=True)
-            time.sleep(1)
-
-            # ---- Bước 6.2: Bấm nút 'Thêm sản phẩm' màu xanh để trượt panel bên phải ra
-            print("   [+] Bấm 'Thêm sản phẩm' để mở bảng chọn...")
-            add_product_btn = page.locator("button:has-text('Thêm sản phẩm')").first
-            add_product_btn.scroll_into_view_if_needed()
-            add_product_btn.click(force=True)
-            time.sleep(1.5) # Chờ panel bên phải trượt ra hoàn toàn
-
-            # --- BƯỚC 6.3: Tương tác với Panel "Thêm từ cửa hàng" bên phải ---
-            print(f"   [+] Đang tìm và nhập SKU ID: {sku_id}")
-            
-            # ---- BƯỚC 6.4.1: Ô tìm kiếm sản phẩm trong panel --> Đổi loại tìm kiếm thành "ID sản phẩm" ---
-            dropdown_trigger = page.locator("span.core-trigger, [class*='core-trigger'], .core-select").filter(has_text="Tên sản phẩm").first
-            if dropdown_trigger.count() == 0:
-                dropdown_trigger = page.locator("text=Tên sản phẩm").first
-                
-            dropdown_trigger.click(force=True)
-            time.sleep(0.8)
-
-            # ---- BƯỚC 6.4.2: Chọn "ID sản phẩm" trong menu dropdown
-            option_id = page.locator(".core-select-option").filter(has_text="ID sản phẩm").first
-            option_id.click(force=True)
-            time.sleep(0.5)
-            print(f"   ✓ Đã chuyển sang chế độ ID sản phẩm thành công.")
-
-            # --- BƯỚC 6.4.3: Nhập SKU ID vào ô tìm kiếm ---
-            print(f"   [+] Nhập SKU ID vào ô tìm kiếm: {sku_id}")
-            search_input = page.locator(".core-drawer-body input[data-tid='m4b_input_search'], input[data-tid='m4b_input_search']").first
-
-            search_input.wait_for(state="visible", timeout=5000)
-            time.sleep(0.5)
-
-            search_input.scroll_into_view_if_needed()
-            search_input.click(force=True)
-            search_input.fill("")
-            time.sleep(0.3)
-
-            search_input.type(str(sku_id), delay=60)
-            time.sleep(0.3)
-            page.keyboard.press("Enter")
-            
-            print(f"   ✓ Đã điền xong SKU ID: {sku_id}, đang chờ kết quả lọc...")
-            time.sleep(3.0) # Chờ hệ thống TikTok Shop load kết quả lọc theo ID
-
-            # --- BƯỚC 6.4.4: Tick chọn checkbox sản phẩm kết quả ---
-            print(f"   [+] Đang chọn checkbox cho SKU ID: {sku_id}")
-            if not sku_id.isdigit():
-                raise RuntimeError(f"SKU ID không hợp lệ: {sku_id!r}")
-            sku_checkbox_selector = f'input[type="checkbox"][value="{sku_id}"]'
-            sku_rows = page.locator("tr.core-table-tr:visible").filter(
-                has=page.locator(sku_checkbox_selector)
+            invitation_name, sku_id = self._configure_invitation_details(
+                sku_info, invite_content, batch_index, attempt, on_state_change,
             )
-            row = sku_rows.first
-            try:
-                row.wait_for(state="visible", timeout=10000)
-            except PWTimeout as exc:
-                raise RuntimeError(
-                    f"Không thấy dòng sản phẩm có checkbox value={sku_id}. "
-                    "Chưa chọn sản phẩm, chưa gửi lời mời. "
-                    "Kiểm tra lại kết quả tìm sản phẩm."
-                ) from exc
-            if sku_rows.count() == 1:
-                checkbox = row.locator(sku_checkbox_selector)
-                if checkbox.count() != 1 or checkbox.is_disabled():
-                    raise RuntimeError(f"Checkbox SKU {sku_id} không duy nhất hoặc bị vô hiệu hóa")
-                if not checkbox.is_checked():
-                    mask = checkbox.locator(
-                        'xpath=ancestor::label[@data-tid="m4b_checkbox"][1]'
-                    ).locator(".core-checkbox-mask")
-                    mask.click(timeout=5000)
-                from playwright.sync_api import expect
-                expect(checkbox).to_be_checked(timeout=5000)
-            else:
-                raise RuntimeError(f"Không xác định được duy nhất sản phẩm SKU {sku_id}")
-                
-            print(f"   ✓ Đã tick chọn thành công SKU ID: {sku_id}")
-            time.sleep(1)
+            self._configure_invitation_product(sku_id, sku_info, on_state_change)
+            self._configure_invitation_samples()
+            failed_creators = self._add_invitation_creators(creator_usernames, batch_index, on_state_change)
+            added_count = self._select_invitation_creators(
+                creator_usernames, batch_index, failed_creators, on_state_change,
+            )
 
-            # ---- BƯỚC 6.4.5: Bấm nút Xác nhận / Thêm ở góc dưới panel bên phải để hoàn tất chọn sản phẩm
-            print("   [+] Xác nhận thêm sản phẩm vào lời mời...")
-            confirm_btn = page.locator(".core-drawer-footer button:has-text('Thêm'), button:has-text('Thêm')").last
-            confirm_btn.scroll_into_view_if_needed()
-            if confirm_btn.is_visible():
-                confirm_btn.click(force=True)
-                print("   ✓ Đã bấm nút 'Thêm' thành công.")
-            else:
-                # Fallback bấm nút có thể đang sáng ở footer
-                page.locator(".core-drawer-footer button").last.click(force=True)
-    
-            time.sleep(1.5)
-
-            #   BƯỚC 6.4.6: Bật switch "Hoa hồng Quảng cáo cửa hàng" và nhập tỉ lệ hoa hồng
-            print("   [+] Đang cấu hình tỉ lệ hoa hồng...")
-            def _fmt_rate(v):
-                # "15%" -> "15", 0.15 -> "15"
-                s = str(v).strip().replace('%', '').replace(',', '.')
-                try:
-                    n = float(s)
-                except ValueError:
-                    return ''
-                if n <= 1:
-                    n *= 100
-                return f"{n:g}"
-            std_rate = _fmt_rate(sku_info.get('base_commission', ''))
-            ads_rate = _fmt_rate(sku_info.get('ads_commission', ''))
-
-            prod_row = page.locator(".core-table-container tbody tr").first
-            prod_row.wait_for(state="visible", timeout=5000)
-
-            ads_switch = prod_row.locator(".core-switch").first
-            ads_switch.scroll_into_view_if_needed()
-            if ads_switch.get_attribute("aria-checked") != "true":
-                ads_switch.click(force=True)
-                time.sleep(0.8)
-
-            rate_inputs = prod_row.locator("input[placeholder*='1,00-80,00']")
-
-            std_input = rate_inputs.nth(0)
-            std_input.click(force=True)
-            std_input.fill(std_rate)
-            time.sleep(0.3)
-
-            ads_input = rate_inputs.nth(1)
-            ads_input.click(force=True)
-            ads_input.fill(ads_rate)
-            time.sleep(0.5)
-
-            print(f"   ✓ Tỉ lệ tiêu chuẩn: {std_input.input_value()}% | Tỉ lệ quảng cáo: {ads_input.input_value()}%")
-
-
-            #####################################################################################
-            # 6. Cài đặt Hàng mẫu (Bật cung cấp hàng mẫu & chọn cài đặt cấp sản phẩm)[cite: 2, 6]
-            #####################################################################################
-            print("   [+] Cấu hình hàng mẫu miễn phí cấp sản phẩm...")
-            sample_header = page.locator("text=Cài đặt hàng mẫu miễn phí").first
-            if sample_header.count() > 0:
-                sample_header.evaluate("el => el.click()")
-                time.sleep(0.8) # Chờ hiệu ứng trượt mở của giao diện TikTok Shop
-
-            # 2. Click chọn "Sử dụng cài đặt hàng mẫu cấp sản phẩm" bên trong
-            sample_option = page.locator("text=Sử dụng cài đặt hàng mẫu cấp sản phẩm").first
-            if sample_option.count() > 0:
-                sample_option.evaluate("el => el.click()")
-                print("   ✓ Đã chọn 'Sử dụng cài đặt hàng mẫu cấp sản phẩm' thành công.")
-            else:
-                print("   ✓ Khối cài đặt đã mở sẵn, tiếp tục...")
-
-            # --- THÊM CREATOR VÀO LỜI MỜI (CHO ĐỢT NÀY) ---
-            print(f"\n👉 Đang thêm {len(creator_usernames)} nhà sáng tạo vào Đợt {batch_index}...")
-            self._record_invitation_state(on_state_change, "draft", "add_creators")
-            creator_header = page.locator("text=Chọn nhà sáng tạo").first
-            if creator_header.count() > 0:
-                creator_header.evaluate("el => el.click()")
-                time.sleep(1.0)
-
-
-                        # ==========================================
-            # GIAI ĐOẠN 1: Gõ tìm và đưa từng creator xuống bảng
-            # ==========================================
-            self._record_invitation_state(on_state_change, "draft", "set_creator_page_size")
-            page_size_ready = self._set_creator_page_size(required=False)
-            self._record_invitation_state(on_state_change, "draft", "add_creators")
-            failed_creators = []
-            for username in creator_usernames:
-                username = str(username).strip()
-                search_creator = page.get_by_placeholder("Tìm kiếm nhà sáng tạo theo tên người dùng hoặc ID người dùng")
-                search_creator.wait_for(state="visible", timeout=5000)
-
-                # Khớp chính xác theo từ, không phân biệt hoa thường
-                exact = re.compile(rf"(?<![\w.]){re.escape(username)}(?![\w.])", re.IGNORECASE)
-                added_ok = False
-
-                for attempt in range(1, 4):
-                    # 1. Đóng popup cũ, focus và xóa sạch ô input
-                    page.keyboard.press("Escape")
-                    search_creator.click()
-                    search_creator.fill("")
-                    time.sleep(0.3)
-
-                    # 2. Gõ từng ký tự để kích hoạt API
-                    search_creator.press_sequentially(username, delay=120)
-                    print(f"     [+] Lần {attempt}: đang tìm '{username}'")
-
-                    # 3. Chờ popup có mục khớp đúng username (thay cho sleep cố định)
-                    items = page.locator("div[role='listitem'].arco-list-item, .m4b-list-item")
-                    target = None
-                    deadline = time.time() + 6
-                    while time.time() < deadline and target is None:
-                        for i in range(items.count()):
-                            it = items.nth(i)
-                            try:
-                                if exact.search(it.inner_text(timeout=500)):
-                                    target = it
-                                    break
-                            except Exception:
-                                continue
-                        if target is None:
-                            time.sleep(0.3)
-
-                    if target is None:
-                        print(f"     ⚠️ Không thấy '{username}' trong popup, thử lại...")
-                        continue
-
-                    # 4. Click thật, không dùng JS click
-                    target.click()
-
-                    # 5. Xác minh username đã xuất hiện trong bảng
-                    try:
-                        page.locator(".core-table-container").get_by_text(exact).first.wait_for(
-                            state="visible", timeout=5000
-                        )
-                        print(f"     [✓] Đã đưa creator '{username}' xuống bảng.")
-                        if not page_size_ready:
-                            self._record_invitation_state(on_state_change, "draft", "set_creator_page_size")
-                            page_size_ready = self._set_creator_page_size(required=True)
-                            self._record_invitation_state(on_state_change, "draft", "add_creators")
-                        added_ok = True
-                        break
-                    except PWTimeout:
-                        print(f"     ⚠️ Chưa thấy '{username}' trong bảng, thử lại...")
-
-                if not added_ok:
-                    print(f"     ❌ Không thêm được creator '{username}' sau 3 lần.")
-                    failed_creators.append(username)
-
-                # Dọn popup trước khi sang creator tiếp theo
-                page.keyboard.press("Escape")
-                time.sleep(0.5)
-
-            # ==========================================
-            # GIAI ĐOẠN 2: Tối đa 50 người trên một trang, tick tổng một lần.
-            # ==========================================
-            print("\n   [+] Đang tick checkbox tổng trên một trang 50/Trang...")
-            self._record_invitation_state(on_state_change, "draft", "select_creators")
-            time.sleep(1.5)
-            if failed_creators:
-                raise RuntimeError(f"Có creator chưa thêm được vào bảng: {failed_creators}; chưa gửi.")
-            added_count = self._select_all_invitation_creators(creator_usernames)
-            time.sleep(1.5)
-            print(f"\n✅ Đã hoàn tất cấu hình lời mời Đợt {batch_index} cho {added_count} creator.")
-            if failed_creators:
-                print(f"     ⚠️ Các creator không thêm được: {failed_creators}")
-            
             # --- XÁC NHẬN TRƯỚC KHI GỬI ---
             print("\n=======================================================")
             print(f" ⚠️  KIỂM TRA LẠI THÔNG TIN BẢN NHÁP LỜI MỜI (ĐỢT {batch_index}):")
@@ -1180,6 +1215,7 @@ class TikTokBrowserAutomation:
             return self._send_target_invitation(invitation_name, added_count, batch_index, on_state_change)
 
         except Exception as e:
+            diagnostics.capture_error(page, e)
             state = self.last_invitation_state
             self._record_invitation_state(
                 on_state_change, state.get("status", "draft"), state.get("stage", "configure_invitation"), error=str(e),
@@ -1190,6 +1226,7 @@ class TikTokBrowserAutomation:
     def share_invitation_via_chat(self):
         """Chia sẻ lời mời; giữ tab đến khi người dùng xác minh gửi đủ."""
         page = self.page
+        diagnostics.set_context(stage="chat", creator=None, keyword=None)
 
         # 1. Bấm nút và bắt tab tin nhắn mới
         msg_btn = page.get_by_role("button", name=re.compile("Nhắn tin cho nhà sáng tạo")).first

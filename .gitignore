@@ -10,9 +10,13 @@ credentials.json
 
 # Checkpoint chứa dữ liệu creator và trạng thái lời mời
 outputs/checkpoints/
+outputs/logs/
+outputs/debug/
 
 # Test chỉ giữ cục bộ theo yêu cầu
 /test/
 
 # Bỏ qua tất cả các file có đuôi .md
 *.md
+!README.md
+.venv/
