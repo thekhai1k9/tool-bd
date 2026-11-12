@@ -1,4 +1,5 @@
 import re
+import datetime
 import gspread
 
 
@@ -33,6 +34,8 @@ class GoogleSheetManager:
         c_orders = find_col(["số món", "đơn"])
         c_category = find_col(["ngành hàng", "hạng mục"])
         c_target = find_col(["mục tiêu"])
+        c_commission_base = find_col(["commission tiêu chuẩn"])
+        c_commission_ads = find_col(["commission ads"])
 
         skus = []
         for row in rows[1:]:
@@ -58,6 +61,8 @@ class GoogleSheetManager:
                 "gmv_rule": get(c_gmv),
                 "orders_rule": get(c_orders),
                 "categories": [c.strip() for c in get(c_category).split("\n") if c.strip()],
+                "base_commission": get(c_commission_base),
+                "ads_commission": get(c_commission_ads),
                 "target": target,
             })
         return skus
@@ -231,4 +236,78 @@ class GoogleSheetManager:
 
         return (len(reasons) == 0), reasons
 
-    # Kiểm tra shop đang sử dụng tool là shop nào bằng DOM trình duyệt
+    # Chunking cho phép tối đa 50 creator cho một lời mời cộng tác
+    def chunk_list(self, lst, batch_size=50):
+        """Chia danh sách thành các nhóm tối đa batch_size phần tử"""
+        for i in range(0, len(lst), batch_size):
+            yield lst[i:i + batch_size]
+
+    def load_invitation_templates(self):
+        """
+        Đọc tab 'NỘI DUNG LỜI MỜI' theo cấu trúc thực tế (SKU ID ở Dòng 2, Nội dung ở các dòng bên dưới)
+        Trả về dict dạng: {'1731921001118140226': 'Nội dung mẫu...', '1735397877631452994': 'Nội dung mẫu...'}
+        """
+        try:
+            sheet = self.spreadsheet.worksheet("NỘI DUNG LỜI MỜI")
+            rows = sheet.get_all_values()
+            
+            if len(rows) < 3:
+                return {}
+
+            # Dòng 2 (index 1 trong Python) chứa các SKU ID
+            sku_row = rows[1]
+            
+            templates = {}
+
+            # Duyệt qua từng cột từ cột B (index 1) đến hết
+            for col_idx in range(1, len(sku_row)):
+                raw_skus = sku_row[col_idx].strip()
+                if not raw_skus:
+                    continue
+
+                # Tách các SKU ID nếu một cột chứa nhiều SKU phân cách bởi dấu ';'
+                sku_list = [s.strip() for s in raw_skus.split(";") if s.strip()]
+
+                # Gom các mẫu nội dung có sẵn ở các dòng bên dưới (Dòng 3 -> Dòng 7, index 2 -> 6)
+                content_samples = []
+                for row_idx in range(2, min(7, len(rows))):
+                    cell_val = rows[row_idx][col_idx].strip() if col_idx < len(rows[row_idx]) else ""
+                    if cell_val:
+                        content_samples.append(cell_val)
+
+                # Chọn mẫu lời mời (Lấy mẫu đầu tiên ở Dòng 3 làm mặc định)
+                selected_template = content_samples[0] if content_samples else ""
+
+                # Gán mẫu lời mời cho tất cả các SKU ID thuộc cột này
+                for sku_id in sku_list:
+                    templates[sku_id] = selected_template
+
+            return templates
+
+        except Exception as e:
+            print(f"   ⚠ Không thể đọc tab 'NỘI DUNG LỜI MỜI': {e}")
+            return {}
+
+    def log_invitation_history(self, invitation_name, total_creators, total_follow):
+        """Ghi một dòng vào tab 'THEO DÕI LỜI MỜI' đúng theo cột A-G."""
+        try:
+            ws = self.spreadsheet.worksheet("THEO DÕI LỜI MỜI")
+
+            today = datetime.datetime.now()
+            expiry = today + datetime.timedelta(days=30)
+            stt = len([v for v in ws.col_values(1)[1:] if v.strip()]) + 1
+
+            ws.append_row(
+                [
+                    stt,                                # A: STT
+                    invitation_name,                    # B: Tên lời mời
+                    total_creators,                     # C: Số KOL/KOC
+                    today.strftime("%d/%m/%Y"),         # D: Ngày gửi
+                    expiry.strftime("%d/%m/%Y"),        # E: Có hiệu lực đến
+                    total_follow,                       # F: Follow-up đã gửi
+                    today.strftime("%d/%m/%Y"),        # G: Ngày follow-up
+                ],
+                value_input_option="USER_ENTERED",
+            )
+        except Exception as e:
+            print(f"     ⚠️ Không ghi được lịch sử lên Google Sheet: {e}")

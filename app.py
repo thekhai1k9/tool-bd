@@ -14,7 +14,6 @@ def main():
     try:
         sheet_mgr = GoogleSheetManager(CREDENTIALS_FILE, SPREADSHEET_URL)
         skus = sheet_mgr.load_skus()
-        print("==============??? sku", skus)
         keywords_by_product = sheet_mgr.load_keywords()
         blacklist = sheet_mgr.load_blacklist()
         existing = sheet_mgr.load_existing_creators()
@@ -33,6 +32,8 @@ def main():
         bot.wait_for_user_login()
         _, current_shop_name = bot.check_current_shop()
 
+        invitation_templates = sheet_mgr.load_invitation_templates()    
+
         if not current_shop_name: 
             print("   ❌ Không xác định được Shop đang đăng nhập. Dừng tool!")
             return
@@ -46,7 +47,6 @@ def main():
             keywords = kw_lookup.get(product.strip().lower())
             sku_shop = str(sku.get("shop", "")).strip().lower()
             
-            print("=====shop_key và product", sku["shop"], shop_key)
             if not keywords:
                 print(f"-> Bỏ qua '{product}': không có keyword trong LIST KEYWORD.")
                 continue
@@ -72,6 +72,8 @@ def main():
                 print("   -> Không có rule followers, bỏ qua lọc follower.")
 
             sku_count = 0
+            creators_for_this_sku = [] # Mảng lưu creator trong RAM
+
             for kw in keywords:
                 if sku_count >= target:
                     break
@@ -95,23 +97,74 @@ def main():
 
                     # Chỉ ghi username vào cột của sản phẩm tương ứng (không tràn cột khác)
                     success = sheet_mgr.append_creator(product, c["username"])
+
                     if not success:
                         continue
                     existing.add(norm)
+
+                    # ĐƯA VÀO LIST TRONG RAM ĐỂ TẠO LỜI MỜI
+                    creators_for_this_sku.append(c["username"])
+
                     sku_count += 1
                     grand_total += 1
-                    print(f"   [+] Ghi {c['username']} | followers={c['followers']} | "
+                    print(f"   [+] Đã ghi Sheet & RAM: {c['username']} | followers={c['followers']} | "
                           f"GMV={c['gmv']} | số món={c['orders']} (SKU {sku_count}/{target}, tổng {grand_total})")
                     time.sleep(MIN_DELAY)
 
             print(f"   → Hoàn tất SKU '{product}': {sku_count}/{target} creator.")
 
+
+            # =========================================================================
+            # TẠO LỜI MỜI (CHIA ĐỢT TỐI ĐA 50 NGƯỜI)
+            # =========================================================================
+            if creators_for_this_sku:
+                print(f"\n🚀 Bắt đầu tạo lời mời cho SKU: {product} (Tổng {len(creators_for_this_sku)} người)...")
+
+                # Điều hướng sang trang Cộng tác mục tiêu
+                bot.go_to_target_collaboration()
+
+                # Chia nhỏ danh sách thành các đợt tối đa 50 người (Chuẩn theo SOP Auto.md)[cite: 2, 3]
+                creator_batches = list(sheet_mgr.chunk_list(creators_for_this_sku, batch_size=50))
+                invite_content = invitation_templates.get(sku['sku_id'], "")
+
+                #vòng lặp tạo lời mời cho từng đợt (_1, _2...)[cite: 3]
+                for batch_index, batch_creators in enumerate(creator_batches, start=1):
+                    print(f"\n--- Đang xử lý ĐỢT {batch_index}/{len(creator_batches)} ({len(batch_creators)} creators) ---")
+
+                    success, inv_name, total_sent = bot.create_target_invitation(
+                        sku_info=sku,
+                        invite_content=invite_content,
+                        creator_usernames=batch_creators,
+                        batch_index=batch_index,
+                    )
+
+
+                    ######################################################################
+                    # GỬI TIN NHẮN CHO CREATOR
+                    ######################################################################
+                    try:
+                        # bot.go_to_target_collaboration()
+                        bot.share_invitation_via_chat()
+                        if success:
+                            # Ghi lịch sử gửi vào tab 'THEO DÕI LỜI MỜI'[cite: 2]
+                            sheet_mgr.log_invitation_history(
+                                invitation_name=inv_name,
+                                total_creators=total_sent,
+                                total_follow=total_sent
+                            )
+                        print(f"   ✓ Đã ghi nhận lịch sử đợt {batch_index} vào Sheet.")
+                    except Exception as e:
+                        print(f"   ⚠️ Không chia sẻ được lời mời '{inv_name}' qua chat: {e}")
+
+            else:
+                print(f"⚠️ SKU '{product}' không có creator nào đạt điều kiện để tạo lời mời.")
+
         print(f"\n=== [HOÀN TẤT] Tổng {grand_total} creator mới ===")
 
     except Exception as e:
         print(f"Đã xảy ra lỗi trong quá trình chạy: {e}")
-    finally:
-        bot.close()
+    # finally:
+    #     bot.close()
 
 
 if __name__ == "__main__":
