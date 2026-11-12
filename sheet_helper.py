@@ -67,10 +67,16 @@ class GoogleSheetManager:
             })
         return skus
 
-    def load_keywords(self):
-        """Đọc tab 'LIST KEYWORD' -> dict {tên sản phẩm: [keyword, ...]}.
+    def load_keywords(self, sheet_name="LIST KEYWORD", optional=False):
+        """Đọc tab keyword -> dict {tên sản phẩm: [keyword, ...]}.
         Hàng 2 (index 1) là tên sản phẩm theo cột; các hàng dưới là keyword."""
-        sheet = self.spreadsheet.worksheet("LIST KEYWORD")
+        try:
+            sheet = self.spreadsheet.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            if not optional:
+                raise
+            print(f"   -> Chưa có tab '{sheet_name}', chỉ dùng nguồn keyword hiện có.")
+            return {}
         rows = sheet.get_all_values()
         if len(rows) < 3:
             return {}

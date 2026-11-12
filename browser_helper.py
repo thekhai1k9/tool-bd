@@ -32,6 +32,9 @@ class TikTokBrowserAutomation:
         self.playwright = None
         self.browser_context = None
         self.page = None
+        self.current_shop_id = None
+        self.target_collaboration_url = None
+        self.target_collaboration_shop_id = None
 
     # ------------------------------------------------------------------ #
     # Khởi động / đăng nhập
@@ -310,7 +313,16 @@ class TikTokBrowserAutomation:
         try:
             rows.first.wait_for(state="visible", timeout=15000)
         except PWTimeout:
-            return None, None
+            self._check_captcha(frame)
+            empty = frame.get_by_text(re.compile(
+                r"không tìm thấy.*nhà sáng tạo|không có kết quả|no results|no creators found",
+                re.IGNORECASE,
+            ))
+            if any(empty.nth(i).is_visible() for i in range(empty.count())):
+                return None, None
+            raise RuntimeError(
+                f"Chưa tải được kết quả keyword '{keyword}'; giữ checkpoint, không coi là hết kết quả."
+            )
         time.sleep(2)
         return frame, rows
 
@@ -416,46 +428,147 @@ class TikTokBrowserAutomation:
             pass
         return False
     
-    # tối đa 200 creator (`max_rows=200` ) và scroll tối đa 10 lần (`scroll_rounds=10`) cho mỗi keyword tìm kiếm
-    def collect_creators_for_keyword(self, keyword, max_rows=100, scroll_rounds=5):
-        """Tìm theo keyword, scroll tải thêm, trả về list dict creator đọc được."""
-        print(f"\n🔍 Đang tìm kiếm với từ khóa: [{keyword}]")
+    def _check_captcha(self, frame=None):
+        for surface in (self.page, frame):
+            if surface is None:
+                continue
+            challenge = surface.locator(
+                'iframe[src*="captcha"]:visible, #captcha-verify-container:visible, '
+                '[id*="captcha_container"]:visible'
+            )
+            if challenge.count():
+                raise RuntimeError(
+                    "CAPTCHA đang chặn thao tác. Đã giữ checkpoint; "
+                    "xác minh thủ công trên phiên hiện tại rồi chạy tiếp."
+                )
 
+    def _pace_creator(self):
+        # Áp dụng cả creator bị loại, không chỉ người được ghi Sheet.
+        previous = getattr(self, "_last_creator_time", 0)
+        delay = max(0, 5 - (time.monotonic() - previous))
+        if delay:
+            self.page.wait_for_timeout(delay * 1000)
+        self._last_creator_time = time.monotonic()
+
+    def _creator_signature(self, rows, column_map):
+        usernames = []
+        for index in range(rows.count()):
+            _, username = self.read_creator_identity(self._cell_texts(rows.nth(index)), column_map)
+            usernames.append(username.strip().lstrip("@").lower())
+        return tuple(usernames)
+
+    def _wait_creator_results_change(self, frame, rows, previous, column_map, timeout=6):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._check_captcha(frame)
+            loading = frame.locator(
+                '.core-spin-loading:visible, .arco-spin-loading:visible, [aria-busy="true"]:visible'
+            )
+            if not loading.count():
+                current = self._creator_signature(rows, column_map)
+                if current and current != previous:
+                    return True
+            self.page.wait_for_timeout(500)
+        if frame.locator(
+            '.core-spin-loading:visible, .arco-spin-loading:visible, [aria-busy="true"]:visible'
+        ).count():
+            raise RuntimeError("Kết quả vẫn đang tải; giữ checkpoint, chưa đánh dấu hết keyword.")
+        return False
+
+    def _advance_creator_results(self, frame, rows, column_map):
+        previous = self._creator_signature(rows, column_map)
+        for _ in range(3):
+            self._check_captcha(frame)
+            scrolled = False
+            if rows.count():
+                last = rows.nth(rows.count() - 1)
+                # Mỗi lượt chỉ một bước < 1 viewport để không bỏ qua dòng virtualized.
+                scrolled = last.evaluate("""element => {
+                    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+                        const style = getComputedStyle(parent);
+                        if (/(auto|scroll)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight) {
+                            parent.scrollBy(0, Math.max(parent.clientHeight * 0.7, 1));
+                            return true;
+                        }
+                    }
+                    const root = element.ownerDocument.scrollingElement;
+                    if (root) {
+                        root.scrollBy(0, Math.max(root.clientHeight * 0.7, 1));
+                        return true;
+                    }
+                    return false;
+                }""")
+            if not scrolled:
+                viewport = self.page.viewport_size or {"height": 600}
+                self.page.mouse.wheel(0, max(1, int(viewport["height"] * 0.7)))
+            if self._wait_creator_results_change(frame, rows, previous, column_map):
+                return True
+
+        next_buttons = frame.locator(
+            'button[aria-label="Next Page"]:visible, button[aria-label="Next page"]:visible, '
+            'button[aria-label="Trang tiếp"]:visible, '
+            '.core-pagination-item-next:visible, .arco-pagination-item-next:visible'
+        )
+        for index in range(next_buttons.count()):
+            button = next_buttons.nth(index)
+            classes = button.get_attribute("class") or ""
+            if not button.is_enabled() or button.get_attribute("aria-disabled") == "true" or "disabled" in classes:
+                continue
+            button.click()
+            if self._wait_creator_results_change(frame, rows, previous, column_map, timeout=15):
+                print("   -> Đã chuyển trang kết quả tiếp theo.")
+                return True
+            raise RuntimeError("Đã bấm trang tiếp nhưng chưa có kết quả mới; giữ checkpoint.")
+        return False
+
+    def iter_creators_for_keyword(self, keyword, seen_usernames=None):
+        """Đọc từng lượt mới, scroll/phân trang; bên gọi dừng ngay khi đủ target."""
+        print(f"\n🔍 Đang tìm kiếm với từ khóa: [{keyword}]")
+        self._check_captcha()
         frame, rows = self.search_keyword(keyword)
         if rows is None:
+            self._check_captcha(frame)
             print(f"   -> Không có hàng kết quả cho từ khóa '{keyword}'.")
-            return []
-
-        self._scroll_to_load(frame, rows, max_rows, scroll_rounds)
+            return
         column_map = self.get_column_map(frame)
-
-        results = []
-        count = min(rows.count(), max_rows)
-        for i in range(count):
-            try:
+        if "creator" not in column_map:
+            raise RuntimeError("Không nhận diện được cột creator; không đánh dấu keyword đã duyệt.")
+        seen = set(seen_usernames or ())
+        windows_seen = set()
+        window = 0
+        while True:
+            self._check_captcha(frame)
+            signature = self._creator_signature(rows, column_map)
+            if signature in windows_seen:
+                print("   -> Kết quả lặp lại, chuyển keyword để tránh quét vô hạn.")
+                return
+            windows_seen.add(signature)
+            window += 1
+            for i in range(rows.count()):
+                self._check_captcha(frame)
                 row = rows.nth(i)
                 cells = self._cell_texts(row)
-                # Debug: in raw text 3 creator đầu tiên để kiểm tra định dạng ô
-                if i < 3:
-                    print(f"   [DEBUG row {i}] raw cells: {cells}")
                 name, username = self.read_creator_identity(cells, column_map)
-                if i < 3:
-                    print(f"   [DEBUG row {i}] name='{name}' username='{username}'")
-                if not username:
-                    if i < 3:
-                        print(f"   [DEBUG row {i}] -> skip (username rỗng)")
+                normalized = username.strip().lstrip("@").lower()
+                if not normalized or normalized in seen:
                     continue
+                self._pace_creator()
                 metrics = self.read_row_metrics(cells, column_map)
-                results.append({"name": name, "username": username, **metrics})
-                if i < 3:
-                    print(f"   [DEBUG row {i}] -> OK, metrics={metrics}")
-            except Exception as e:
-                import traceback
-                print(f"   ⚠ Lỗi đọc dòng {i}: {e}")
-                traceback.print_exc()
+                invited = self.is_already_invited(row, cells)
+                seen.add(normalized)
+                yield {
+                    "name": name, "username": username, **metrics,
+                    "already_invited": invited, "keyword": keyword,
+                    "window": window, "row": i + 1,
+                }
+            if not self._advance_creator_results(frame, rows, column_map):
+                print("   -> Không có kết quả mới sau 3 lượt chờ/scroll; chuyển keyword.")
+                return
 
-        print(f"   -> Thu thập {len(results)} creator cho '{keyword}'.")
-        return results
+    def collect_creators_for_keyword(self, keyword, max_rows=100, scroll_rounds=5):
+        """Tương thích caller cũ; luồng DAILY dùng iterator không giới hạn 100 dòng."""
+        from itertools import islice
+        return list(islice(self.iter_creators_for_keyword(keyword), max_rows))
 
 
 
@@ -485,6 +598,7 @@ class TikTokBrowserAutomation:
                 return None
                 
             current_shop_id = shop_ids[0]
+            self.current_shop_id = current_shop_id
             shop_name = SHOP_ID_MAP.get(current_shop_id, f"Unknown Shop (ID: {current_shop_id})")
             
             print(f"   [URL] {current_url}")
@@ -501,28 +615,227 @@ class TikTokBrowserAutomation:
 
 
     def go_to_target_collaboration(self):
-        """Điều hướng vào trang Cộng tác mục tiêu"""
+        """Lưu URL danh sách lần đầu; quay thẳng về đó sau trang gửi thành công."""
         print("\n👉 Đang chuyển sang trang 'Cộng tác mục tiêu'...")
         try:
             page = self.page
-            # Click menu Cộng tác -> Cộng tác mục tiêu
-            page.locator("text=Cộng tác").first.click(force=True)
-            time.sleep(1)
-            page.locator("text=Cộng tác mục tiêu").first.click(force=True)
-            time.sleep(2)
-            page.wait_for_load_state("networkidle")
+            source_shop_id = parse_qs(urlparse(page.url).query).get("shop_id", [None])[0]
+            expected_shop_id = self.current_shop_id or source_shop_id
+            if self.target_collaboration_url and self.target_collaboration_shop_id != expected_shop_id:
+                self.target_collaboration_url = None
+            if self.target_collaboration_url:
+                page.goto(self.target_collaboration_url, wait_until="domcontentloaded", timeout=30000)
+            else:
+                target_menu = page.get_by_text("Cộng tác mục tiêu", exact=True)
+                if not any(target_menu.nth(i).is_visible() for i in range(target_menu.count())):
+                    self.click_visible("Cộng tác", timeout=10000)
+                self.click_visible("Cộng tác mục tiêu", timeout=10000)
+
+            page.get_by_role("button", name="Mời cộng tác", exact=True).first.wait_for(
+                state="visible", timeout=15000,
+            )
+            destination = urlparse(page.url)
+            destination_shop_id = parse_qs(destination.query).get("shop_id", [None])[0]
+            if expected_shop_id and destination_shop_id and destination_shop_id != expected_shop_id:
+                raise RuntimeError("Trang Cộng tác mục tiêu chuyển sang shop khác; không tạo lời mời.")
+            if destination.path.rstrip("/").endswith("/create"):
+                raise RuntimeError("Vẫn ở trang tạo/gửi lời mời cũ, chưa về danh sách Cộng tác mục tiêu.")
+            self.target_collaboration_url = page.url
+            self.target_collaboration_shop_id = expected_shop_id or destination_shop_id
             print("   ✓ Đã vào trang Cộng tác mục tiêu.")
             return True
         except Exception as e:
+            self.target_collaboration_url = None
             print(f"   ❌ Lỗi khi điều hướng vào Cộng tác mục tiêu: {e}")
             return False
 
-    def create_target_invitation(self, sku_info, invite_content, creator_usernames, batch_index=1):
+    def _set_creator_page_size(self, required=True):
+        """Chọn 50/Trang trong riêng phần Chọn nhà sáng tạo."""
+        search = self.page.get_by_placeholder("Tìm kiếm nhà sáng tạo theo tên người dùng hoặc ID người dùng")
+        region = search.locator(
+            "xpath=ancestor::*[contains(concat(' ',normalize-space(@class),' '),' select-creators ')][1]"
+        )
+        if region.count() == 0:
+            region = search.locator("xpath=ancestor::*[.//table/thead//th[contains(.,'Nhà sáng tạo')]][1]")
+        if region.count() == 0:
+            if not required:
+                return False  # Bảng rỗng có thể chưa render footer; thử sau creator đầu tiên.
+            raise RuntimeError("Chưa thấy Kích cỡ trang của bảng creator; chưa gửi.")
+        combo = region.locator('.core-pagination-option[aria-label="Kích cỡ trang"] [role="combobox"]:visible')
+        if combo.count() == 0 and not required:
+            return False
+        if combo.count() != 1:
+            raise RuntimeError("Không xác định được duy nhất Kích cỡ trang của bảng creator.")
+        value = combo.locator(".core-select-view-value")
+        is_fifty = lambda: bool(re.fullmatch(r"\s*50\s*/\s*Trang\s*", value.inner_text(), re.IGNORECASE))
+        if is_fifty():
+            return True
+        combo.click(timeout=5000)
+        popup_id = combo.get_attribute("aria-controls")
+        if not popup_id or not re.fullmatch(r"[\w-]+", popup_id):
+            raise RuntimeError("Dropdown Kích cỡ trang không có aria-controls hợp lệ.")
+        popup = self.page.locator(f'[id="{popup_id}"]:visible')
+        popup.wait_for(state="visible", timeout=5000)
+        selected_option = None
+        # DOM thực tế dùng '50/trang'; giữ các nhãn khác để tương thích.
+        for label in ("50/Trang", "50/trang", "50"):
+            option = popup.get_by_role("option", name=label, exact=True)
+            if option.count() == 0:
+                option = popup.get_by_text(label, exact=True)
+            try:
+                option.wait_for(state="visible", timeout=2000)
+            except PWTimeout:
+                continue
+            if option.count() != 1:
+                raise RuntimeError(f"Tùy chọn {label!r} không duy nhất trong popup Kích cỡ trang.")
+            selected_option = option
+            break
+        if selected_option is None:
+            popup_text = popup.inner_text()
+            print(f"   [DEBUG] DOM popup #{popup_id}: {popup.inner_html()[:2500]}")
+            raise RuntimeError(f"Không thấy mục 50, 50/trang hoặc 50/Trang trong popup #{popup_id}; nội dung: {popup_text[:800]!r}")
+        selected_option.click(timeout=5000)
+        deadline = time.monotonic() + 5
+        while not is_fifty():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Chưa đổi được 50/Trang; hiện tại: {value.inner_text()!r}")
+            self.page.wait_for_timeout(100)
+        print("   ✓ Bảng Nhà sáng tạo đã đặt 50/Trang.")
+        return True
+
+    def _check_invitation_creator_page(self, table, expected, select):
+        """Tick tổng một trang; đọc username từ cả dòng, không phụ thuộc text element."""
+        names, checkboxes = [], []
+        for row in table.locator("tbody tr:visible").all():
+            checkbox = row.locator('input[type="checkbox"]')
+            if checkbox.count() == 0:
+                continue
+            text = row.inner_text()
+            matches = [
+                name for name in expected
+                if re.search(rf"(?<![\w.])@?{re.escape(name)}(?![\w.])", text, re.IGNORECASE)
+            ]
+            if len(matches) != 1 or checkbox.count() != 1 or checkbox.is_disabled():
+                raise RuntimeError(f"Dòng creator không khớp duy nhất danh sách đợt hoặc checkbox bị khóa: {text!r}")
+            if matches[0] in names:
+                raise RuntimeError(f"Creator {matches[0]} xuất hiện lặp trong bảng; chưa gửi.")
+            names.append(matches[0])
+            checkboxes.append(checkbox)
+        if not names:
+            raise RuntimeError("Trang bảng creator chưa có dòng có thể chọn; chưa gửi.")
+
+        if select and not all(checkbox.is_checked() for checkbox in checkboxes):
+            master = table.locator('thead th.core-table-checkbox input[type="checkbox"]')
+            if master.count() != 1 or master.is_disabled():
+                raise RuntimeError("Không xác định được checkbox tổng của bảng Nhà sáng tạo.")
+            if not master.is_checked():
+                master.locator("xpath=ancestor::label[1]").locator(".core-checkbox-mask").click(timeout=5000)
+
+        deadline = time.monotonic() + (5 if select else 0)
+        while not all(checkbox.is_checked() for checkbox in checkboxes):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Có creator chưa được tick sau chọn tổng trên trang 50/Trang; chưa gửi.")
+            self.page.wait_for_timeout(100)
+        return tuple(names)
+
+    def _creator_selection_page_button(self, region, direction):
+        controls = region.locator(
+            f'.core-pagination-item-{direction}:visible, '
+            f'.arco-pagination-item-{direction}:visible'
+        )
+        if controls.count() > 1:
+            raise RuntimeError("Vùng bảng creator có nhiều bộ phân trang; không tự chọn nhầm bảng.")
+        if controls.count() == 0:
+            return None
+        control = controls.first
+        if (
+            not control.is_enabled()
+            or control.get_attribute("aria-disabled") == "true"
+            or "disabled" in (control.get_attribute("class") or "")
+        ):
+            return None
+        return control
+
+    def _select_all_invitation_creators(self, creator_usernames):
+        normalized = [str(name).strip().lstrip("@").lower() for name in creator_usernames]
+        expected = set(normalized)
+        if not expected or "" in expected or len(expected) != len(normalized):
+            raise RuntimeError("Danh sách đợt trống hoặc có username trùng; chưa gửi.")
+        if len(expected) > 50:
+            raise RuntimeError("Một đợt chỉ được tối đa 50 creator; chưa gửi.")
+        self._set_creator_page_size(required=True)
+        headers = self.page.locator("thead").filter(has_text=re.compile("Nhà sáng tạo", re.IGNORECASE))
+        tables = self.page.locator("table:visible").filter(has=headers)
+        tables.first.wait_for(state="visible", timeout=10000)
+        if tables.count() != 1:
+            raise RuntimeError("Không xác định được duy nhất bảng Nhà sáng tạo; chưa gửi.")
+        table = tables.first
+        containers = table.locator(
+            "xpath=ancestor::*[.//*[contains(@class,'core-pagination') "
+            "or contains(@class,'arco-pagination')]][1]"
+        )
+        region = containers if containers.count() == 1 else table
+        if region.locator("table:visible").count() > 1:
+            raise RuntimeError("Không giới hạn được phân trang vào riêng bảng Nhà sáng tạo; chưa gửi.")
+        total = re.search(r"Tổng số hàng\s*:\s*(\d+)", region.inner_text(), re.IGNORECASE)
+        if total and int(total.group(1)) != len(expected):
+            raise RuntimeError(f"Bảng có {total.group(1)} creator, đợt yêu cầu {len(expected)}; chưa gửi.")
+
+        # Không chuyển trang sau khi chọn: TikTok có thể làm mất lựa chọn trang trước.
+        deadline = time.monotonic() + 10
+        while table.locator("tbody tr:visible").count() != len(expected):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Chưa hiển thị đủ {len(expected)} creator trên cùng một trang 50/Trang; chưa gửi.")
+            self.page.wait_for_timeout(200)
+        if any(self._creator_selection_page_button(region, direction) is not None for direction in ("prev", "next")):
+            raise RuntimeError("Danh sách creator vẫn còn nhiều trang sau khi đặt 50/Trang; chưa gửi.")
+        names = self._check_invitation_creator_page(table, expected, select=True)
+        if set(names) != expected:
+            raise RuntimeError(f"Danh sách creator trên trang không khớp đợt; thiếu {sorted(expected - set(names))}; chưa gửi.")
+        return len(expected)
+
+    def _record_invitation_state(self, callback, status, stage, **details):
+        self.last_invitation_state = {
+            **getattr(self, "last_invitation_state", {}),
+            "status": status, "stage": stage, "error": None, **details,
+        }
+        if callback is not None:
+            callback(dict(self.last_invitation_state))
+
+    def _send_target_invitation(self, invitation_name, added_count, batch_index, on_state_change):
+        confirm = input(f"👉 Bạn có muốn GỬI lời mời Đợt {batch_index} này không? (y/n): ")
+        if confirm.strip().lower() != "y":
+            self._record_invitation_state(on_state_change, "ready", "awaiting_approval", error="Người dùng chưa duyệt gửi.")
+            print(f"⏸ Chưa gửi Đợt {batch_index}; danh sách được giữ để chạy tiếp.")
+            return False, invitation_name, 0
+        success_message = self.page.get_by_text("Đã gửi lời mời cộng tác!", exact=True)
+        success_message.wait_for(state="hidden", timeout=3000)
+        send_button = self.page.locator("button:has-text('Gửi')")
+        send_button.wait_for(state="visible", timeout=5000)
+        self._record_invitation_state(on_state_change, "sending", "send", invitation_name=invitation_name)
+        send_button.click(force=True)
+        print("Đã bấm Gửi, đang chờ TikTok xác nhận...")
+        try:
+            success_message.wait_for(state="visible", timeout=30000)
+        except PWTimeout:
+            self._record_invitation_state(
+                on_state_change, "sending", "verify_send", error="Không thấy thông báo gửi thành công trong 30 giây."
+            )
+            print("CHƯA XÁC NHẬN sau thao tác Gửi. Giữ trạng thái sending; không tự gửi lại.")
+            return False, invitation_name, 0
+        self._record_invitation_state(on_state_change, "sent", "log_history", total_sent=added_count)
+        print(f"✓ TikTok xác nhận đã gửi lời mời: {invitation_name}")
+        return True, invitation_name, added_count
+
+    def create_target_invitation(self, sku_info, invite_content, creator_usernames, batch_index=1,
+                                 on_state_change=None, attempt=1):
         """
         Thực hiện toàn bộ tạo lời mời cộng tác mục tiêu + thêm creator vào lời mời (Theo đợt tối đa 50 người)[cite: 2, 3]
         """
         page = self.page
+        self.last_invitation_state = {}
         try:
+            self._record_invitation_state(on_state_change, "draft", "configure_invitation")
             # 1. Bấm nút 'Mời cộng tác' góc trên phải
             print("👉 Bấm 'Mời cộng tác'...")
             page.locator("button:has-text('Mời cộng tác')").first.click(force=True)
@@ -535,6 +848,9 @@ class TikTokBrowserAutomation:
             suffix_4_digits = sku_id[-4:] if len(sku_id) >= 4 else sku_id
             today_str = datetime.datetime.now().strftime("%d/%m")
             invitation_name = f"BD_AUTO_{suffix_4_digits}-{today_str}_{batch_index}"
+            if attempt > 1:
+                invitation_name += f"_R{attempt}"
+            self._record_invitation_state(on_state_change, "draft", "configure_invitation", invitation_name=invitation_name)
             
             print(f"   [+] Tên lời mời: {invitation_name}")
            
@@ -595,6 +911,7 @@ class TikTokBrowserAutomation:
 
             # 6. Chọn sản phẩm (SKU)
             print("   [+] Chuyển chế độ tìm kiếm sang 'ID sản phẩm'...")
+            self._record_invitation_state(on_state_change, "draft", "select_product")
             
             # ----- Bước 6.1: Bấm vào thanh tiêu đề "Chọn sản phẩm" để xổ mục xuống (nếu đang đóng)
             section_header = page.locator("text=Chọn sản phẩm").first
@@ -750,6 +1067,7 @@ class TikTokBrowserAutomation:
 
             # --- THÊM CREATOR VÀO LỜI MỜI (CHO ĐỢT NÀY) ---
             print(f"\n👉 Đang thêm {len(creator_usernames)} nhà sáng tạo vào Đợt {batch_index}...")
+            self._record_invitation_state(on_state_change, "draft", "add_creators")
             creator_header = page.locator("text=Chọn nhà sáng tạo").first
             if creator_header.count() > 0:
                 creator_header.evaluate("el => el.click()")
@@ -759,6 +1077,9 @@ class TikTokBrowserAutomation:
                         # ==========================================
             # GIAI ĐOẠN 1: Gõ tìm và đưa từng creator xuống bảng
             # ==========================================
+            self._record_invitation_state(on_state_change, "draft", "set_creator_page_size")
+            page_size_ready = self._set_creator_page_size(required=False)
+            self._record_invitation_state(on_state_change, "draft", "add_creators")
             failed_creators = []
             for username in creator_usernames:
                 username = str(username).strip()
@@ -809,6 +1130,10 @@ class TikTokBrowserAutomation:
                             state="visible", timeout=5000
                         )
                         print(f"     [✓] Đã đưa creator '{username}' xuống bảng.")
+                        if not page_size_ready:
+                            self._record_invitation_state(on_state_change, "draft", "set_creator_page_size")
+                            page_size_ready = self._set_creator_page_size(required=True)
+                            self._record_invitation_state(on_state_change, "draft", "add_creators")
                         added_ok = True
                         break
                     except PWTimeout:
@@ -823,34 +1148,14 @@ class TikTokBrowserAutomation:
                 time.sleep(0.5)
 
             # ==========================================
-            # GIAI ĐOẠN 2: Chỉ tick/đếm các dòng khớp username của đợt.
+            # GIAI ĐOẠN 2: Tối đa 50 người trên một trang, tick tổng một lần.
             # ==========================================
-            print("\n   [+] Đang kiểm tra checkbox từng creator của đợt...")
+            print("\n   [+] Đang tick checkbox tổng trên một trang 50/Trang...")
+            self._record_invitation_state(on_state_change, "draft", "select_creators")
             time.sleep(1.5)
-
-            added_count = 0
-            normalized_usernames = [str(u).strip().lstrip("@").lower() for u in creator_usernames]
-            if len(set(normalized_usernames)) != len(normalized_usernames):
-                raise RuntimeError("Danh sách đợt chứa username trùng; chưa gửi.")
-            for username in normalized_usernames:
-                identity = page.get_by_text(
-                    re.compile(rf"^\s*@?{re.escape(username)}\s*$", re.IGNORECASE)
-                )
-                creator_rows = page.locator(".core-table-container tbody tr:visible").filter(
-                    has=identity
-                )
-                if creator_rows.count() != 1:
-                    raise RuntimeError(
-                        f"Creator {username}: tìm thấy {creator_rows.count()} dòng, cần đúng 1; chưa gửi."
-                    )
-                row = creator_rows.first
-                row_input = row.locator("input[type='checkbox']")
-                if row_input.count() != 1:
-                    raise RuntimeError(f"Không xác định được checkbox creator {username}; chưa gửi.")
-                if not row_input.is_checked():
-                    row.locator("label.core-checkbox").click()
-                expect(row_input).to_be_checked(timeout=5000)
-                added_count += 1
+            if failed_creators:
+                raise RuntimeError(f"Có creator chưa thêm được vào bảng: {failed_creators}; chưa gửi.")
+            added_count = self._select_all_invitation_creators(creator_usernames)
             time.sleep(1.5)
             print(f"\n✅ Đã hoàn tất cấu hình lời mời Đợt {batch_index} cho {added_count} creator.")
             if failed_creators:
@@ -871,31 +1176,16 @@ class TikTokBrowserAutomation:
                     f"thêm thất bại: {failed_creators}; chưa gửi."
                 )
             
-            confirm = input(f"👉 Bạn có muốn GỬI lời mời Đợt {batch_index} này không? (y/n): ")
-            if confirm.lower() == 'y':
-                success_message = page.get_by_text("Đã gửi lời mời cộng tác!", exact=True)
-                # Không nhận nhầm thông báo thành công còn lại từ đợt trước.
-                success_message.wait_for(state="hidden", timeout=3000)
-                page.locator("button:has-text('Gửi')").click(force=True)
-                print("Đã bấm Gửi, đang chờ TikTok xác nhận...")
-                try:
-                    success_message.wait_for(state="visible", timeout=30000)
-                except PWTimeout:
-                    print(
-                        "CHƯA XÁC NHẬN: không thấy thông báo gửi thành công. "
-                        "Không tự gửi lại; kiểm tra lịch sử trước khi tiếp tục."
-                    )
-                    return False, invitation_name, 0
-                print(f"✓ TikTok xác nhận đã gửi lời mời: {invitation_name}")
-                print(f"   Số creator đã chọn trước gửi: {added_count}")
-                return True, invitation_name, added_count
-            else:
-                print(f"⏸ Hủy gửi Đợt {batch_index}. Lời mời được giữ ở dạng bản nháp.")
-                return False, invitation_name, 0
+            self._record_invitation_state(on_state_change, "ready", "awaiting_approval")
+            return self._send_target_invitation(invitation_name, added_count, batch_index, on_state_change)
 
         except Exception as e:
-            print(f"❌ Lỗi trong quá trình tạo lời mời cộng tác Đợt {batch_index}: {e}")
-            return False, None, 0
+            state = self.last_invitation_state
+            self._record_invitation_state(
+                on_state_change, state.get("status", "draft"), state.get("stage", "configure_invitation"), error=str(e),
+            )
+            print(f"❌ Đợt {batch_index} lỗi ở bước {state.get('stage', 'configure_invitation')}: {e}")
+            return False, state.get("invitation_name"), 0
 
     def share_invitation_via_chat(self):
         """Chia sẻ lời mời; giữ tab đến khi người dùng xác minh gửi đủ."""
