@@ -35,10 +35,6 @@ class BookingWorkflow:
         sku_shop = str(sku.get("shop", "")).strip().lower()
         diagnostics.set_context(sku=sku["sku_id"], batch=None, keyword=None, creator=None, stage="sku_setup")
 
-        if not keywords and not english_keywords:
-            print(f"-> Bỏ qua '{product}': không có keyword trong LIST KEYWORD hoặc LIST KEYWORD EN.")
-            return grand_total
-
         is_shop_match = (shop_key in sku_shop) or (sku_shop in shop_key)
         if not is_shop_match:
             print(f"-> Bỏ qua SKU '{product}': Shop đang đăng nhập '{current_shop_name}' không trùng với shop trong list CMS SKU: '{sku.get('shop')}'")
@@ -49,15 +45,14 @@ class BookingWorkflow:
         if not progress.path.exists():
             print("   -> Checkpoint mới: số đã gửi DAILY chỉ tính các đợt được bản code này ghi nhận.")
         if progress.blocking_batches:
-            blocked = progress.blocking_batches[0]
-            raise RuntimeError(
-                f"SKU {sku['sku_id']}, đợt {blocked['index']} đang {blocked['status']} "
-                f"ở bước {blocked.get('stage', 'không rõ (checkpoint cũ)')}. "
-                f"Kiểm tra lịch sử lời mời/chat trước; không tự gửi lại. Checkpoint: {progress.path}"
-            )
+            self._resume_sent_chats(progress)
         sent_today = len(progress.sent_usernames)
         if sent_today >= target:
             print(f"-> SKU '{product}' đã gửi {sent_today}/{target} hôm nay, bỏ qua.")
+            return grand_total
+
+        if not keywords and not english_keywords:
+            print(f"-> Bỏ qua '{product}': không có keyword trong LIST KEYWORD hoặc LIST KEYWORD EN.")
             return grand_total
 
         criteria = {key: sku[key] for key in ("followers_rule", "gmv_rule", "orders_rule", "categories")}
@@ -283,24 +278,90 @@ class BookingWorkflow:
                     total_creators=total_sent,
                     total_follow=0,
                 )
-                try:
-                    batch_state["stage"] = "chat"
-                    diagnostics.set_context(stage="chat")
-                    progress.save()
-                    if not bot.share_invitation_via_chat():
-                        raise RuntimeError("Chat chưa xác nhận gửi đủ; giữ trạng thái để kiểm tra.")
-                except Exception as e:
-                    diagnostics.capture_error(bot.page, e)
-                    batch_state["error"] = str(e)
-                    progress.save()
-                    print(f"   ⚠️ Không chia sẻ được lời mời '{inv_name}' qua chat: {e}")
-                    raise
-                diagnostics.set_context(stage="update_followup_history")
-                sheet_mgr.update_followup_history(inv_name, total_sent)
-                batch_state.update(status="completed", stage="done", error=None)
-                progress.save()
-                diagnostics.set_context(stage="done")
-                print(f"   ✓ Follow-up '{inv_name}': {total_sent} creator (gán theo tổng đã mời).")
+                self._finish_batch_chat(progress, batch_state, batch_creators)
 
         else:
             print(f"⚠️ SKU '{product}' không có creator nào đạt điều kiện để tạo lời mời.")
+
+
+    def _finish_batch_chat(self, progress, batch_state, batch_creators, chat_url=None, cached_result=None):
+        sheet_mgr, bot = self.sheet_mgr, self.bot
+        inv_name, batch_index = batch_state["invitation_name"], batch_state["index"]
+        try:
+            batch_state["stage"] = "chat"
+            diagnostics.set_context(stage="chat")
+            progress.save()
+            def save_chat_result(result):
+                batch_state["chat_result"] = result
+                progress.save()
+
+            if cached_result is not None:
+                chat_result = cached_result
+            elif chat_url is not None:
+                chat_result = bot.share_invitation_via_chat(batch_creators, on_result=save_chat_result, chat_url=chat_url)
+            else:
+                chat_result = bot.share_invitation_via_chat(batch_creators, on_result=save_chat_result)
+            save_chat_result(chat_result)
+            if chat_result.get("confirmed") is not True:
+                raise RuntimeError("Chat chưa xác nhận gửi đủ; giữ trạng thái để kiểm tra.")
+            expected = {creator_rules.normalize_username(name) for name in batch_creators}
+            selected = chat_result["selected_usernames"]
+            rate_limit = chat_result["rate_limit_usernames"]
+            if (len(set(selected)) != len(selected) or len(set(rate_limit)) != len(rate_limit)
+                    or set(selected) & set(rate_limit) or set(selected) | set(rate_limit) != expected
+                    or chat_result["followup_count"] != len(selected)):
+                raise RuntimeError("Kết quả chat không khớp danh sách đợt; chưa cập nhật Sheet.")
+        except Exception as e:
+            diagnostics.capture_error(bot.page, e)
+            batch_state["error"] = str(e)
+            progress.save()
+            print(f"   ⚠️ Không chia sẻ được lời mời '{inv_name}' qua chat: {e}")
+            raise
+        diagnostics.set_context(stage="update_followup_history")
+        batch_state["stage"] = "update_followup_history"
+        progress.save()
+        sheet_mgr.update_followup_history(inv_name, chat_result["followup_count"], rate_limit)
+        batch_state.update(status="completed", stage="done", error=None)
+        progress.save()
+        diagnostics.set_context(stage="done")
+        print(f"   ✓ Follow-up '{inv_name}': {chat_result['followup_count']} creator; "
+              f"rate limit: {len(rate_limit)} (theo lựa chọn chat và xác nhận người dùng).")
+
+    def _resume_sent_chats(self, progress):
+        batches = progress.blocking_batches
+        # Do not resume any sends while another batch has an uncertain invitation result.
+        for batch in batches:
+            if batch['status'] != 'sent' or batch.get('stage') not in ('chat', 'update_followup_history'):
+                raise RuntimeError(
+                    f"Đợt {batch['index']} đang {batch['status']} ở bước {batch.get('stage', 'không rõ')}. "
+                    f"Kiểm tra lịch sử trước; không tự gửi lại. Checkpoint: {progress.path}"
+                )
+        for batch in batches:
+            name = batch.get('invitation_name')
+            names = batch.get('usernames', [])
+            if not name or not names or len(set(names)) != len(names):
+                raise RuntimeError('Checkpoint thiếu tên lời mời hoặc danh sách creator; không tự khôi phục chat.')
+            result = batch.get('chat_result', {})
+            diagnostics.set_context(batch=batch['index'], stage='chat_resume', keyword=None, creator=None)
+            print(f"   -> Khôi phục Đợt {batch['index']}: {name}; giữ lời mời đã gửi.")
+            if result.get('confirmed') is True:
+                self._finish_batch_chat(progress, batch, names, cached_result=result)
+                continue
+            if result.get('share_clicked') is True:
+                raise RuntimeError('Đã thao tác Chia sẻ nhưng chat chưa xác nhận; kiểm tra TikTok trước, không tự gửi lại.')
+            if result.get('share_clicked') is not False:
+                answer = input(
+                    f"Đợt {batch['index']} ({name}) chưa lưu trạng thái chat. "
+                    "Chỉ nếu chắc chắn CHƯA bấm Chia sẻ, nhập 'CHUA CHIA SE' để tiếp tục; Enter để dừng: "
+                ).strip()
+                if answer != 'CHUA CHIA SE':
+                    raise RuntimeError('Chưa xác minh chat chưa gửi; giữ checkpoint, không tự gửi lại.')
+            chat_url = result.get('chat_url')
+            if not chat_url:
+                chat_url = input(
+                    f"Mở trang chat của đúng lời mời '{name}', dán URL có plan_id và shop_id "
+                    "(không tạo lời mời mới); Enter để dừng: "
+                ).strip()
+            if not chat_url:
+                raise RuntimeError('Chưa có URL chat đúng lời mời; giữ checkpoint.')
+            self._finish_batch_chat(progress, batch, names, chat_url=chat_url)

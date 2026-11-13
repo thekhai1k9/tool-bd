@@ -255,11 +255,16 @@ class GoogleSheetManager:
             print(f"     ⚠️ Không ghi được lịch sử lên Google Sheet: {e}")
             raise
 
-    def update_followup_history(self, invitation_name, total_follow):
-        """Cập nhật F-G của duy nhất dòng khớp tên lời mời, giữ nguyên A-E."""
+    def update_followup_history(self, invitation_name, total_follow, rate_limit_usernames=()):
+        """Update only the three named follow-up columns of one matching invitation."""
         ws = self._worksheet("THEO DÕI LỜI MỜI")
+        headers = [" ".join(value.split()).upper() for value in ws.row_values(1)]
+        titles = ("TÊN LỜI MỜI", "FOLLOW-UP ĐÃ GỬI", "NGÀY FOLLOW-UP", "RATE LIMIT TIN NHẮN CREATOR")
+        if any(headers.count(title) != 1 for title in titles):
+            raise RuntimeError("Thiếu hoặc trùng tiêu đề cột theo dõi lời mời; chưa cập nhật follow-up.")
+        columns = {title: headers.index(title) + 1 for title in titles}
         matching_rows = [
-            row for row, name in enumerate(ws.col_values(2), start=1)
+            row for row, name in enumerate(ws.col_values(columns["TÊN LỜI MỜI"]), start=1)
             if name.strip() == invitation_name
         ]
         if len(matching_rows) != 1:
@@ -268,8 +273,14 @@ class GoogleSheetManager:
                 "không cập nhật follow-up để tránh sửa nhầm."
             )
         row = matching_rows[0]
-        ws.update(
-            range_name=f"F{row}:G{row}",
-            values=[[total_follow, datetime.datetime.now().strftime("%d/%m/%Y")]],
-            value_input_option="USER_ENTERED",
+        if not isinstance(total_follow, int) or isinstance(total_follow, bool) or total_follow < 0:
+            raise ValueError("Số follow-up phải là số nguyên không âm")
+        usernames = [self.normalize_username(name) for name in rate_limit_usernames]
+        if any(not name or not re.fullmatch(r"[\w.]+", name) for name in usernames) or len(set(usernames)) != len(usernames):
+            raise ValueError("Danh sách rate limit có username không hợp lệ hoặc trùng")
+        today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%d/%m/%Y")
+        ws.batch_update(
+            data=[{"range": gspread.utils.rowcol_to_a1(row, columns[title]), "values": [[value]]}
+                  for title, value in zip(titles[1:], (total_follow, today, "/".join(usernames)))],
+            value_input_option="RAW",
         )

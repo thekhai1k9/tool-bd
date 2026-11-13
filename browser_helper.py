@@ -1223,51 +1223,178 @@ class TikTokBrowserAutomation:
             print(f"❌ Đợt {batch_index} lỗi ở bước {state.get('stage', 'configure_invitation')}: {e}")
             return False, state.get("invitation_name"), 0
 
-    def share_invitation_via_chat(self):
-        """Chia sẻ lời mời; giữ tab đến khi người dùng xác minh gửi đủ."""
+    def _chat_recipient_popup(self, chat_page):
+        title = chat_page.get_by_text("Gửi lời mời", exact=True).filter(visible=True)
+        title.wait_for(state="visible", timeout=10000)
+        popup = title.locator(
+            "xpath=ancestor::*[.//button[normalize-space(.)='Chia sẻ'] and .//tbody][1]"
+        )
+        if popup.count() != 1:
+            raise RuntimeError("Không xác định được duy nhất popup chia sẻ; chưa gửi chat.")
+        return popup
+
+    def _scan_chat_recipients(self, chat_page, creator_usernames):
+        """Read only: scroll the recipient table, never click or change checkboxes."""
+        expected = [str(name).strip().lstrip("@").lower() for name in creator_usernames]
+        if not expected or len(set(expected)) != len(expected) or any(not name for name in expected):
+            raise RuntimeError("Danh sách creator đợt chat trống hoặc trùng; chưa gửi.")
+        popup = self._chat_recipient_popup(chat_page)
+        content = popup.locator(".core-table-content-scroll")
+        content.wait_for(state="visible", timeout=10000)
+        if content.count() != 1:
+            raise RuntimeError("Không xác định được duy nhất vùng danh sách creator trong popup.")
+        content.locator("tbody tr.core-table-tr").first.wait_for(state="visible", timeout=10000)
+        scroll_script = """(root, action) => {
+            const viewport = [root, ...root.querySelectorAll('*')].find(el =>
+                el.querySelector('tbody') && /(auto|scroll)/.test(getComputedStyle(el).overflowY)
+                && el.scrollHeight > el.clientHeight + 1);
+            if (!viewport) return {top: 0, bottom: true};
+            if (action === 'reset') viewport.scrollTop = 0;
+            if (action === 'next') viewport.scrollTop += Math.max(1, viewport.clientHeight * 0.7);
+            return {top: viewport.scrollTop,
+                bottom: viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 2};
+        }"""
+        content.evaluate(scroll_script, "reset")
+        chat_page.wait_for_timeout(200)
+        observed, settled = {}, 0
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            snapshot = content.locator("tbody tr.core-table-tr").evaluate_all("""rows => rows.map(row => {
+                const names = row.querySelectorAll('span.text-neutral-text1.text-body-m-medium');
+                const boxes = row.querySelectorAll('input[type="checkbox"]');
+                const box = boxes[0];
+                return {name: names.length === 1 ? names[0].textContent.trim() : null,
+                    valid: names.length === 1 && boxes.length === 1,
+                    checked: box ? box.checked : false,
+                    disabled: box ? (box.disabled || box.closest('label')?.getAttribute('aria-disabled') === 'true') : false};
+            })""")
+            before = len(observed)
+            for item in snapshot:
+                if not item["valid"] or not re.fullmatch(r"@[\w.]+", item["name"] or ""):
+                    raise RuntimeError("Không đọc được username/checkbox duy nhất trong dòng chat; chưa gửi.")
+                name = item["name"].lstrip("@").lower()
+                if name not in expected:
+                    raise RuntimeError(f"Popup chứa creator ngoài đợt: {name}; chưa gửi chat.")
+                state = (item["checked"], item["disabled"])
+                if name in observed and observed[name] != state:
+                    raise RuntimeError(f"Lựa chọn chat của {name} thay đổi trong lúc đọc; kiểm tra lại.")
+                observed[name] = state
+            position = content.evaluate(scroll_script, "read")
+            if position["bottom"] and len(observed) == before:
+                settled += 1
+            else:
+                settled = 0
+            if settled >= 3:
+                break
+            content.evaluate(scroll_script, "next")
+            chat_page.wait_for_timeout(300)
+        else:
+            raise RuntimeError("Đọc danh sách chat quá thời gian; chưa gửi.")
+        missing = set(expected) - set(observed)
+        if missing:
+            raise RuntimeError(f"Chưa đọc đủ creator popup ({len(observed)}/{len(expected)}); thiếu: {sorted(missing)}")
+        unchecked_available = [name for name in expected if not observed[name][0] and not observed[name][1]]
+        if unchecked_available:
+            raise RuntimeError(f"Creator chưa tích nhưng checkbox còn khả dụng: {unchecked_available}; không tự click.")
+        selected = [name for name in expected if observed[name][0]]
+        rate_limit = [name for name in expected if not observed[name][0]]
+        counter = popup.get_by_text(re.compile(r"Đã chọn\s*\d+\s*/\s*\d+"))
+        if counter.count() != 1:
+            raise RuntimeError("Không đọc được duy nhất bộ đếm creator chat; chưa gửi.")
+        match = re.search(r"Đã chọn\s*(\d+)\s*/\s*(\d+)", counter.inner_text())
+        if not match or int(match.group(1)) != len(selected):
+            raise RuntimeError("Bộ đếm chat không khớp checkbox đã đọc; chưa gửi.")
+        print(f"   [+] Chat: {len(selected)}/{len(expected)} đã chọn; rate limit: {len(rate_limit)}.")
+        return {"selected_usernames": selected, "rate_limit_usernames": rate_limit}
+
+    def _open_saved_chat(self, chat_url):
+        destination = urlparse(chat_url)
+        query = parse_qs(destination.query)
+        shop_ids, plan_ids = query.get('shop_id', []), query.get('plan_id', [])
+        if (destination.scheme != 'https' or destination.netloc != 'affiliate.tiktok.com'
+                or destination.path.rstrip('/') != '/seller/im' or not self.current_shop_id
+                or shop_ids != [str(self.current_shop_id)] or len(plan_ids) != 1 or not plan_ids[0].isdigit()):
+            raise RuntimeError('URL chat không hợp lệ hoặc không khớp shop đang đăng nhập; chưa gửi.')
+        matches = [page for page in self.page.context.pages if page.url == chat_url and not page.is_closed()]
+        if len(matches) > 1:
+            raise RuntimeError('Có nhiều tab cùng URL chat; giữ một tab đúng lời mời rồi chạy lại.')
+        if matches:
+            return matches[0]
+        chat_page = self.page.context.new_page()
+        chat_page.goto(chat_url, wait_until='domcontentloaded', timeout=30000)
+        actual = urlparse(chat_page.url)
+        actual_query = parse_qs(actual.query)
+        if (actual.scheme != destination.scheme or actual.netloc != destination.netloc
+                or actual.path.rstrip('/') != '/seller/im'
+                or actual_query.get('shop_id') != shop_ids or actual_query.get('plan_id') != plan_ids):
+            raise RuntimeError('Trang chat chuyển sang shop hoặc lời mời khác; chưa gửi.')
+        return chat_page
+
+    def share_invitation_via_chat(self, creator_usernames, on_result=None, chat_url=None):
+        """Share only the existing selection; persist counts before/after manual confirmation."""
         page = self.page
         diagnostics.set_context(stage="chat", creator=None, keyword=None)
 
-        # 1. Bấm nút và bắt tab tin nhắn mới
-        msg_btn = page.get_by_role("button", name=re.compile("Nhắn tin cho nhà sáng tạo")).first
-        msg_btn.wait_for(state="visible", timeout=10000)
-        with page.context.expect_page(timeout=10000) as new_page_info:
-            msg_btn.click()
-        chat_page = new_page_info.value
+        # Resume an existing invitation's chat without creating or sending another invitation.
+        if chat_url is not None:
+            chat_page = self._open_saved_chat(chat_url)
+        else:
+            msg_btn = page.get_by_role("button", name=re.compile("Nhắn tin cho nhà sáng tạo")).first
+            msg_btn.wait_for(state="visible", timeout=10000)
+            with page.context.expect_page(timeout=10000) as new_page_info:
+                msg_btn.click()
+            chat_page = new_page_info.value
         chat_page.wait_for_load_state("domcontentloaded")
         print(f"   [+] Trang tin nhắn: {chat_page.url}")
+        result = {"selected_usernames": [], "rate_limit_usernames": [],
+                  "expected_count": len(creator_usernames), "confirmed": False,
+                  "share_clicked": False, "followup_count": 0, "chat_url": chat_page.url}
 
-        # 2. Chờ popup "Gửi lời mời"
+        def save_result():
+            if on_result is not None:
+                on_result({**result, "selected_usernames": list(result["selected_usernames"]),
+                           "rate_limit_usernames": list(result["rate_limit_usernames"])})
+
+        save_result()
         popup_title = chat_page.get_by_text("Gửi lời mời", exact=True).first
         popup_title.wait_for(state="visible", timeout=30000)
         time.sleep(1)
-
-        # 3. Đọc số creator đã chọn để đối chiếu với log
-        try:
-            selected = chat_page.get_by_text(re.compile(r"Đã chọn\s*\d+\s*/\s*\d+")).first
-            if selected.count() > 0:
-                print(f"   [+] Popup: {selected.inner_text()}")
-        except Exception as e:
-            print(f"   ⚠️ Không đọc được số đã chọn: {e}")
+        selection = self._scan_chat_recipients(chat_page, creator_usernames)
+        result.update(selection)
+        save_result()
+        if not selection["selected_usernames"]:
+            print("   -> Không có creator khả dụng; không bấm Chia sẻ. Ghi 0 follow-up và danh sách rate limit.")
+            result["confirmed"] = True
+            save_result()
+            chat_page.close()
+            return result
 
         # 4. Bấm "Chia sẻ"
-        share_btn = chat_page.get_by_role("button", name=re.compile(r"^\s*Chia sẻ\s*$")).last
+        share_btn = self._chat_recipient_popup(chat_page).get_by_role("button", name=re.compile(r"^\s*Chia sẻ\s*$"))
         share_btn.wait_for(state="visible", timeout=10000)
         if input("Xác nhận GỬI qua chat cho các creator đang chọn? (y/n): ").strip().lower() != "y":
             print("Không gửi qua chat; giữ tab để kiểm tra.")
-            return False
+            return result
+        # Read again after operator approval in case the popup selection changed.
+        if self._scan_chat_recipients(chat_page, creator_usernames) != selection:
+            raise RuntimeError("Lựa chọn chat đã đổi sau xác nhận; chưa bấm Chia sẻ.")
+        result["share_clicked"] = True
+        save_result()
         share_btn.click()
 
         # Popup đóng/networkidle không chứng minh hàng đợi gửi đã hoàn tất.
         print("   [+] Đã bấm Chia sẻ. Giữ tab chat mở, chưa xác nhận gửi đủ.")
         print("   Kiểm tra từng người nhận và các cảnh báo giới hạn/lỗi trên TikTok.")
         completed = input(
-            "Chỉ khi đã xác minh gửi đủ người nhận, nhập 'DA GUI DU' để đóng tab "
+            f"Chỉ khi đã xác minh gửi đủ {len(selection['selected_usernames'])} người đang chọn, "
+            "nhập 'DA GUI DU' để đóng tab "
             "và tiếp tục. Nếu thiếu/chưa rõ, nhấn Enter để giữ tab và dừng: "
         ).strip()
         if completed != "DA GUI DU":
             print("   ⚠ Chưa xác nhận gửi đủ. Giữ tab chat; không tự gửi lại.")
-            return False
+            return result
+        result.update(confirmed=True, followup_count=len(creator_usernames) - len(selection["rate_limit_usernames"]))
+        save_result()
         chat_page.close()
         print("   ✓ Người dùng đã xác minh gửi đủ; đã đóng tab chat.")
-        return True
+        return result
