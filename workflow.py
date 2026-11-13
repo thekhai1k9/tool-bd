@@ -1,8 +1,24 @@
 """Per-SKU orchestration; browser, Sheet and checkpoint policies stay in their adapters."""
 from dataclasses import dataclass
+from itertools import islice
 import diagnostics
 import creator_rules
 from search_progress import DailyProgress, build_search_terms
+
+GMV_BUCKETS = [
+    ("0-50K₫",      50_000),
+    ("50K₫-100K₫",  100_000),
+    ("100K₫-500K₫", 500_000),
+    ("500K₫-1M₫",   1_000_000),
+    ("1M₫+",        None),
+]
+
+ORDER_BUCKETS = [
+    ("0-10",      10),
+    ("10-100",    100),
+    ("100-1.000", 1_000),
+    ("1.000+",    None),
+]
 
 
 @dataclass
@@ -12,6 +28,15 @@ class RunSources:
     existing: set
     invitations: dict
 
+def choose_buckets(minimum, buckets):
+    if minimum is None:
+        return []
+
+    return [
+        label
+        for label, upper in buckets
+        if upper is None or upper > minimum
+    ]
 
 class BookingWorkflow:
     def __init__(self, sheet_mgr, bot, shop_name, creator_search_url, sources):
@@ -66,7 +91,8 @@ class BookingWorkflow:
                         "reason": "Hạng mục CMS SKU đã thay đổi; không tái sử dụng lựa chọn cũ.",
                     }
                 print("   -> Hạng mục đã đổi: bỏ lựa chọn chưa gửi từ bộ lọc cũ, giữ lịch sử.")
-            progress.data.update(criteria=criteria, scanned={}, finished_keywords=[])
+            progress.data.update(criteria=criteria, scanned={}, finished_keywords=[],
+                                 search_round=1, keyword_progress={})
             progress.save()
 
         # Recheck exclusions from the old combined duplicate rule, without resetting send history.
@@ -112,32 +138,20 @@ class BookingWorkflow:
             bot.page.goto(creator_search_url)
             bot.find_search_input()
 
-        # Bộ lọc hạng mục đọc từ cột 'NGÀNH HÀNG / HẠNG MỤC KOL/KOC'
-        diagnostics.set_context(stage="filters")
-        bot.reset_filters()
-        for cat in sku["categories"]:
-            if not bot.apply_category_filter(cat):
-                print(f"   -> Bỏ qua hạng mục không tìm thấy: {cat}")
-
-        # Bộ lọc followers đọc từ 'YÊU CẦU FOLLOWERS' (vd '1000<Followers<30000')
-        fmin, fmax = creator_rules.parse_follower_rule(sku["followers_rule"])
-        if fmin is not None:
-            if not bot.apply_follower_filter(fmin, fmax):
-                raise RuntimeError("Chưa áp dụng được bộ lọc followers")
-
-
+        # Bộ lọc hạng mục đọc từ cột 'NGÀNH HÀNG / HẠNG MỤC KOL/KOC / GMV / SỐ MÓN BÁN RA'
+        self.apply_sku_filters(sku)
 
         sku_count, grand_total = self.collect_creators(
             sku, progress, sent_today, keywords, english_keywords, grand_total,
         )
 
-        print(f"   → Hoàn tất SKU '{product}': {sku_count}/{target} creator.")
+        print(f"   → Kết quả tìm SKU '{product}': {sku_count}/{target} creator.")
 
         if sku_count < target:
             print(
                 f"⚠️ SKU '{product}' thiếu {target - sku_count} creator sau khi duyệt "
                 f"keyword/brand/biến thể. Chưa tạo/gửi lời mời; checkpoint: {progress.path}. "
-                "Bổ sung keyword trong LIST KEYWORD hoặc LIST KEYWORD EN rồi chạy tiếp."
+                "Giữ checkpoint rồi chạy lại để thử nguồn cũ; có thể bổ sung LIST KEYWORD/LIST KEYWORD EN."
             )
             return grand_total
         creators_for_this_sku = [
@@ -152,7 +166,53 @@ class BookingWorkflow:
         self.send_batches(sku, progress, creators_for_this_sku)
         return grand_total
 
+    def apply_sku_filters(self, sku):
+        bot = self.bot
+        diagnostics.set_context(stage="filters")
+        bot.reset_filters()
+        for cat in sku["categories"]:
+            if not bot.apply_category_filter(cat):
+                print(f"   -> Bỏ qua hạng mục không tìm thấy: {cat}")
+
+        # Bộ lọc followers đọc từ 'YÊU CẦU FOLLOWERS' (vd '1000<Followers<30000')
+        fmin, fmax = creator_rules.parse_follower_rule(sku["followers_rule"])
+        if fmin is not None:
+            if not bot.apply_follower_filter(fmin, fmax):
+                raise RuntimeError("Chưa áp dụng được bộ lọc followers")
+
+        # Bộ lọc gmv từ cms sku
+        gmin = creator_rules.parse_min_rule(sku["gmv_rule"])
+        bot.apply_performance_filter(
+            "GMV",
+            choose_buckets(gmin, GMV_BUCKETS),
+        )
+        # Bộ lọc số món bán ra từ cms sku
+        omin = creator_rules.parse_min_rule(sku["orders_rule"])
+        bot.apply_performance_filter(
+            "Số món bán ra",
+            choose_buckets(omin, ORDER_BUCKETS),
+        )
+
+
     def collect_creators(self, sku, progress, sent_today, keywords, english_keywords, grand_total):
+        target = sku["target"]
+        while sent_today + len(progress.pending_usernames) < target:
+            before = len(progress.pending_usernames)
+            round_number = progress.data["search_round"]
+            print(f"   -> Vòng tìm {round_number}: tối đa {100 * 2 ** min(round_number - 1, 2)} creator mới/keyword.")
+            count, grand_total = self._collect_creator_round(
+                sku, progress, sent_today, keywords, english_keywords, grand_total,
+            )
+            if count >= target:
+                return count, grand_total
+            progress.data["search_round"] = round_number + 1
+            progress.save()
+            if len(progress.pending_usernames) == before:
+                print("   -> Cả vòng không thêm creator đạt yêu cầu; giữ checkpoint để lần sau thử lại.")
+                break
+        return sent_today + len(progress.pending_usernames), grand_total
+
+    def _collect_creator_round(self, sku, progress, sent_today, keywords, english_keywords, grand_total):
         sheet_mgr, bot = self.sheet_mgr, self.bot
         product, target = sku["product"], sku["target"]
         existing = self.sources.existing
@@ -164,55 +224,141 @@ class BookingWorkflow:
             f"{len(search_terms)} keyword/brand/biến thể."
         )
 
+        # Chưa quét trước, sau đó ưu tiên keyword có nhiều người đạt.
+        states = progress.data["keyword_progress"]
+        round_number = progress.data["search_round"]
+        budget = 100 * 2 ** min(round_number - 1, 2)
+        search_terms.sort(key=lambda kw: (
+            kw in states,
+            -states.get(kw, {}).get("qualified_count", 0),
+        ))
         for kw in search_terms:
             if sku_count >= target:
                 break
-            if any(done.casefold() == kw.casefold() for done in progress.data["finished_keywords"]):
+            if states.get(kw, {}).get("round") == round_number and states[kw].get("status") != "running":
                 continue
 
             diagnostics.set_context(keyword=kw, creator=None, stage="discover_creators")
             scan_key = next((key for key in progress.data["scanned"] if key.casefold() == kw.casefold()), kw)
             scanned = progress.data["scanned"].setdefault(scan_key, {})
             creators = bot.iter_creators_for_keyword(kw, set(scanned))
-            keyword_finished = True
-            for c in creators:
-                diagnostics.set_context(creator=c["username"])
-                norm = creator_rules.normalize_username(c["username"])
-                if not norm:
-                    continue
-                ok, reasons = creator_rules.validate_creator(c, sku)
-                if norm in existing:
-                    reasons.append("trùng LIST LƯU TẠM/lượt hiện tại")
-                if c.get("already_invited"):
-                    reasons.append("TikTok hiển thị đã mời hoặc không thể mời")
-                scanned[norm] = {**c, "reasons": reasons}
-                if not ok or reasons:
+            state = progress.update_keyword(
+                kw, round=round_number, status="running", stop_reason=None, error_type=None,
+                new_scan_budget=budget, round_scanned_count=(
+                    states.get(kw, {}).get("round_scanned_count", 0)
+                    if states.get(kw, {}).get("round") == round_number else 0
+                ), scanned_count=len(scanned),
+                qualified_count=states.get(kw, {}).get("qualified_count", 0),
+            )
+            stop_reason = "no_new_results"
+            try:
+                for c in islice(creators, max(0, budget - state["round_scanned_count"])):
+                    diagnostics.set_context(creator=c["username"])
+                    norm = creator_rules.normalize_username(c["username"])
+                    if not norm:
+                        continue
+                    ok, reasons = creator_rules.validate_creator(c, sku)
+                    if norm in existing:
+                        reasons.append("trùng LIST LƯU TẠM/lượt hiện tại")
+                    if c.get("already_invited"):
+                        reasons.append("TikTok hiển thị đã mời hoặc không thể mời")
+                    if norm in progress.data["invitation_conflicts"]:
+                        reasons.append("Trùng lặp lời mời được TikTok xác nhận trong checkpoint hôm nay")
+                    scanned[norm] = {**c, "reasons": reasons}
+                    state.update(round_scanned_count=state["round_scanned_count"] + 1,
+                                 scanned_count=len(scanned), last_scanned_username=norm)
+                    progress.update_keyword(kw, **state)
+                    if not ok or reasons:
+                        progress.save()
+                        print(f"   [-] Loại {c['username']}: {'; '.join(reasons)}")
+                        continue
+
+                    # Lưu trước khi gọi Sheet để khôi phục được cả khi mạng/tiến trình lỗi.
+                    progress.data["selected"][norm] = {**c, "sheet_saved": False}
                     progress.save()
-                    print(f"   [-] Loại {c['username']}: {'; '.join(reasons)}")
-                    continue
+                    if not sheet_mgr.append_creator(product, c["username"]):
+                        raise RuntimeError(f"Không ghi được creator {c['username']} vào Sheet; đã giữ checkpoint.")
+                    progress.data["selected"][norm]["sheet_saved"] = True
+                    progress.save()
+                    existing.add(norm)
 
-                # Lưu trước khi gọi Sheet để khôi phục được cả khi mạng/tiến trình lỗi.
-                progress.data["selected"][norm] = {**c, "sheet_saved": False}
-                progress.save()
-                if not sheet_mgr.append_creator(product, c["username"]):
-                    raise RuntimeError(f"Không ghi được creator {c['username']} vào Sheet; đã giữ checkpoint.")
-                progress.data["selected"][norm]["sheet_saved"] = True
-                progress.save()
-                existing.add(norm)
-
-                sku_count += 1
-                grand_total += 1
-                print(f"   [+] Đã ghi Sheet & RAM: {c['username']} | followers={c['followers']} | "
-                      f"GMV={c['gmv']} | số món={c['orders']} (SKU {sku_count}/{target}, tổng {grand_total})")
-                if sku_count >= target:
-                    keyword_finished = False
-                    creators.close()
-                    break
-            if keyword_finished:
-                progress.data["finished_keywords"].append(kw)
-                progress.save()
+                    sku_count += 1
+                    grand_total += 1
+                    progress.update_keyword(kw, qualified_count=state["qualified_count"] + 1)
+                    print(f"   [+] Đã ghi Sheet & RAM: {c['username']} | followers={c['followers']} | "
+                          f"GMV={c['gmv']} | số món={c['orders']} (SKU {sku_count}/{target}, tổng {grand_total})")
+                    if sku_count >= target:
+                        stop_reason = "daily_reached"
+                        break
+                if stop_reason != "daily_reached" and state["round_scanned_count"] >= budget:
+                    stop_reason = "scan_budget_reached"
+            except BaseException as error:
+                progress.update_keyword(
+                    kw, status="running", stop_reason="interrupted" if isinstance(error, KeyboardInterrupt)
+                    else "scan_failed", error_type=type(error).__name__,
+                )
+                raise
+            finally:
+                creators.close()
+            progress.update_keyword(
+                kw, status="paused" if stop_reason == "scan_budget_reached" else "temporary_exhausted"
+                if stop_reason == "no_new_results" else "completed", stop_reason=stop_reason,
+            )
 
         return sku_count, grand_total
+
+    def replace_invitation_conflicts(self, sku, progress, batch, conflicts):
+        names = {creator_rules.normalize_username(name) for name in conflicts}
+        expected = set(batch["usernames"])
+        if not names or not names <= expected or batch["status"] not in ("draft", "ready"):
+            raise RuntimeError("Danh sách trùng không khớp đợt chưa gửi; dừng để kiểm tra.")
+        batch.setdefault("required_size", len(batch["usernames"]))
+        for name in names:
+            progress.data["invitation_conflicts"][name] = {
+                "username": name, "status": "invitation_conflict", "reason": "Trùng lặp lời mời",
+                "batch_index": batch["index"], "day": progress.data["day"],
+            }
+            progress.data["selected"].pop(name, None)
+            self.sources.existing.add(name)
+        batch["usernames"] = [name for name in batch["usernames"] if name not in names]
+        batch.update(status="draft", stage="replace_creators")
+        progress.save()
+        reserved = {name for other in progress.data["batches"] if other is not batch
+                    and other["status"] != "superseded" for name in other["usernames"]}
+
+        def candidates():
+            return [name for name in progress.pending_usernames
+                    if name not in reserved and name not in batch["usernames"]]
+
+        missing = batch["required_size"] - len(batch["usernames"])
+        if len(candidates()) < missing:
+            draft_page = self.bot.page
+            search_page = draft_page.context.new_page()
+            try:
+                self.bot.page = search_page
+                search_page.goto(self.creator_search_url, wait_until="domcontentloaded")
+                self.bot.find_search_input()
+                self.apply_sku_filters(sku)
+                progress.data["search_round"] += 1
+                progress.save()
+                required_total = len(progress.sent_usernames) + len(progress.pending_usernames) + missing - len(candidates())
+                self.collect_creators(
+                    {**sku, "target": required_total}, progress, len(progress.sent_usernames),
+                    self.sources.keywords.get(sku["product"].strip().lower(), []),
+                    self.sources.english_keywords.get(sku["product"].strip().lower(), []), 0,
+                )
+            finally:
+                self.bot.page = draft_page
+                search_page.close()
+                draft_page.bring_to_front()
+        additions = candidates()[:missing]
+        if len(additions) != missing:
+            progress.save()
+            raise RuntimeError(f"Chưa đủ người thay thế: cần {missing}, có {len(additions)}; giữ bản nháp/checkpoint.")
+        batch["usernames"].extend(additions)
+        progress.save()
+        print(f"   [CONFLICT] Đợt {batch['index']}: loại {sorted(names)}, thay bằng {additions}.")
+        return [progress.data["selected"][name]["username"] for name in batch["usernames"]]
 
     def send_batches(self, sku, progress, creators_for_this_sku):
         sheet_mgr, bot = self.sheet_mgr, self.bot
@@ -249,7 +395,11 @@ class BookingWorkflow:
                     batch_index=batch_index,
                     on_state_change=save_batch_state,
                     attempt=batch_state["attempt"],
+                    on_creator_conflicts=lambda names: self.replace_invitation_conflicts(
+                        sku, progress, batch_state, names,
+                    ),
                 )
+                batch_creators = [progress.data["selected"][name]["username"] for name in batch_state["usernames"]]
 
 
                 ######################################################################

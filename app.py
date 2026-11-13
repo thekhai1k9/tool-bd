@@ -1,11 +1,38 @@
 from sheet_helper import GoogleSheetManager
 from browser_helper import TikTokBrowserAutomation
 from workflow import BookingWorkflow, RunSources
+import argparse
+from pathlib import Path
+import re
 import diagnostics
 
 from config import CREDENTIALS_FILE, SPREADSHEET_URL
 
-def main():
+def profile_directory(profile):
+    name = str(profile).strip().lower()
+    reserved = {'con', 'prn', 'aux', 'nul'} | {
+        f'{prefix}{number}' for prefix in ('com', 'lpt') for number in range(1, 10)
+    }
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name) or name in reserved:
+        raise ValueError('Tên profile phải gồm chữ không dấu, số, dấu - hoặc _, tối đa 64 ký tự; không dùng tên thiết bị Windows.')
+    return str(Path('user_data') / name)
+
+
+def parse_arguments(argv=None):
+    def profile_name(value):
+        try:
+            return Path(profile_directory(value)).name
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(str(error)) from error
+
+    parser = argparse.ArgumentParser(description='TikTok Shop creator automation')
+    parser.add_argument('--profile', type=profile_name, default=None,
+                        help='Phiên đăng nhập riêng, ví dụ rizin hoặc lunave; bỏ trống để dùng user_data hiện tại.')
+    return parser.parse_args(argv)
+
+
+def main(profile=None):
+    profile_dir = profile_directory(profile) if profile is not None else None
     diagnostics.set_context(shop=None, sku=None, batch=None, keyword=None, creator=None, stage="load_sources")
     print("--- [TASK 1] KHỞI ĐỘNG HỆ THỐNG TỰ ĐỘNG ---")
 
@@ -25,7 +52,11 @@ def main():
         print(f"Lỗi kết nối hoặc đọc Google Sheet: {e}")
         return
 
-    bot = TikTokBrowserAutomation()
+    if profile_dir is not None:
+        print(f'-> Profile trình duyệt: {profile_dir}')
+        bot = TikTokBrowserAutomation(user_data_dir=profile_dir)
+    else:
+        bot = TikTokBrowserAutomation()
     grand_total = 0
 
     try:
@@ -60,5 +91,6 @@ def main():
 
 
 if __name__ == "__main__":
+    args = parse_arguments()
     with diagnostics.RunSession():
-        main()
+        main(profile=args.profile)

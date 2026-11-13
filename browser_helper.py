@@ -298,6 +298,43 @@ class TikTokBrowserAutomation:
             print(f"   ❌ Lọc followers thất bại: {e}")
             return False
 
+    # Apply GMV/ Số món filter
+    def apply_performance_filter(self, filter_name, labels):
+        if not labels:
+            return
+
+        self.close_dropdown()
+
+        # Bỏ qua text GMV/Số món bán ra nằm trong bảng kết quả.
+        filters = self.page.get_by_text(filter_name, exact=True)
+        filter_visible = False
+
+        for i in range(filters.count()):
+            item = filters.nth(i)
+
+            if item.locator("xpath=ancestor::th | ancestor::td").count():
+                continue
+
+            if item.is_visible():
+                filter_visible = True
+                break
+
+        # Chỉ chuyển tab khi dropdown cần dùng chưa hiển thị.
+        if not filter_visible:
+            self.open_tab("Hiệu suất")
+
+        for label in labels:
+            self.close_dropdown()
+            self.click_visible(filter_name, force=True)
+
+            if not self._tick_option_by_text(label):
+                raise RuntimeError(
+                    f"Không chọn được bộ lọc {filter_name}: {label}"
+                )
+
+        self.close_dropdown()
+        print(f"   ✓ {filter_name}: {', '.join(labels)}")
+
     # ------------------------------------------------------------------ #
     # Tìm kiếm / thu thập creator
     # ------------------------------------------------------------------ #
@@ -460,51 +497,110 @@ class TikTokBrowserAutomation:
 
     def _wait_creator_results_change(self, frame, rows, previous, column_map, timeout=6):
         deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        saw_loading = False
         while time.monotonic() < deadline:
             self._check_captcha(frame)
             loading = frame.locator(
                 '.core-spin-loading:visible, .arco-spin-loading:visible, [aria-busy="true"]:visible'
             )
+            saw_loading = saw_loading or bool(loading.count())
             if not loading.count():
                 current = self._creator_signature(rows, column_map)
                 if current and current != previous:
+                    print(f"   [SCROLL] Có thay đổi sau {time.monotonic() - started:.1f}s | "
+                          f"dòng DOM={len(previous)}->{len(current)} | "
+                          f"cuối={previous[-1:]!r}->{current[-1:]!r} | đã thấy loading={saw_loading}")
                     return True
             self.page.wait_for_timeout(500)
         if frame.locator(
             '.core-spin-loading:visible, .arco-spin-loading:visible, [aria-busy="true"]:visible'
         ).count():
+            print(f"   [SCROLL] Hết {timeout}s nhưng loading vẫn hiển thị; giữ checkpoint.")
             raise RuntimeError("Kết quả vẫn đang tải; giữ checkpoint, chưa đánh dấu hết keyword.")
+        print(f"   [SCROLL] Không đổi sau {timeout}s | đã thấy loading={saw_loading} | "
+              f"dòng DOM={rows.count()} | cuối={previous[-1:]!r}")
         return False
+
+    def _log_creator_scroll(self, rows, phase, scroll=False):
+        if not rows.count():
+            raise RuntimeError("Không còn dòng để nhận diện vùng cuộn; giữ checkpoint.")
+        state = rows.last.evaluate("""(element, scroll) => {
+            let target = element.ownerDocument.scrollingElement;
+            let source = 'document';
+            for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+                if (/(auto|scroll)/.test(getComputedStyle(parent).overflowY)
+                    && parent.scrollHeight > parent.clientHeight) {
+                    target = parent;
+                    source = 'ancestor';
+                    break;
+                }
+            }
+            if (!target) return null;
+            const before = target.scrollTop;
+            if (scroll) target.scrollBy(0, Math.max(target.clientHeight * 0.7, 1));
+            return {source, tag: target.tagName, className: target.className,
+                before, scrollTop: target.scrollTop, clientHeight: target.clientHeight,
+                scrollHeight: target.scrollHeight,
+                remaining: Math.max(0, target.scrollHeight - target.clientHeight - target.scrollTop)};
+        }""", scroll)
+        if not state or state["clientHeight"] <= 0:
+            raise RuntimeError("Không xác định được vùng cuộn hợp lệ; giữ checkpoint.")
+        print(f"   [SCROLL] {phase}: {state}")
+        return state
 
     def _advance_creator_results(self, frame, rows, column_map):
         previous = self._creator_signature(rows, column_map)
-        for _ in range(3):
+        deadline = time.monotonic() + 120
+        bottom_attempts = 0
+        stuck_attempts = 0
+        step = 0
+        while bottom_attempts < 3:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Cuộn quá 120s chưa xác định được tiến độ; giữ checkpoint, chưa coi là hết nguồn.")
             self._check_captcha(frame)
-            scrolled = False
-            if rows.count():
-                last = rows.nth(rows.count() - 1)
-                # Mỗi lượt chỉ một bước < 1 viewport để không bỏ qua dòng virtualized.
-                scrolled = last.evaluate("""element => {
-                    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
-                        const style = getComputedStyle(parent);
-                        if (/(auto|scroll)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight) {
-                            parent.scrollBy(0, Math.max(parent.clientHeight * 0.7, 1));
-                            return true;
-                        }
-                    }
-                    const root = element.ownerDocument.scrollingElement;
-                    if (root) {
-                        root.scrollBy(0, Math.max(root.clientHeight * 0.7, 1));
-                        return true;
-                    }
-                    return false;
-                }""")
-            if not scrolled:
-                viewport = self.page.viewport_size or {"height": 600}
-                self.page.mouse.wheel(0, max(1, int(viewport["height"] * 0.7)))
-            if self._wait_creator_results_change(frame, rows, previous, column_map):
+            step += 1
+            before = self._log_creator_scroll(rows, f"bước {step} trước cuộn")
+            self._log_creator_scroll(rows, f"bước {step} thực hiện cuộn 70%", scroll=True)
+            print("   [SCROLL] Nghỉ 1.5s sau cuộn để trang xử lý.")
+            self.page.wait_for_timeout(1500)
+            self._check_captcha(frame)
+            after = self._log_creator_scroll(rows, f"bước {step} sau nghỉ")
+            moved = after["scrollTop"] - before["scrollTop"]
+            current = self._creator_signature(rows, column_map)
+            new_names = set(current) - set(previous) - {""}
+            loading = frame.locator(
+                '.core-spin-loading:visible, .arco-spin-loading:visible, [aria-busy="true"]:visible'
+            ).count()
+            print(f"   [SCROLL] bước={step} | di chuyển={moved:.0f}px | "
+                  f"còn đáy={after['remaining']:.0f}px | DOM={len(previous)}->{len(current)} | "
+                  f"username mới={len(new_names)} | mẫu={sorted(new_names)[:5]} | loading={bool(loading)}")
+            if current and current != previous:
+                if loading:
+                    return self._wait_creator_results_change(frame, rows, previous, column_map, timeout=15)
                 return True
+            near_bottom = after["remaining"] <= 300
+            at_bottom = after["remaining"] <= 2
+            if near_bottom:
+                print(f"   [SCROLL] Gần đáy; chờ tải thêm tối đa 15s | đã chạm đáy={at_bottom}.")
+                if self._wait_creator_results_change(frame, rows, previous, column_map, timeout=15):
+                    return True
+                after = self._log_creator_scroll(rows, f"bước {step} sau chờ tải")
+                at_bottom = after["remaining"] <= 2
+            if at_bottom:
+                bottom_attempts += 1
+                print(f"   [SCROLL] Đã chạm đáy, chưa có dữ liệu mới: {bottom_attempts}/3 lượt.")
+            else:
+                bottom_attempts = 0
+                if moved <= 0 and after["scrollHeight"] <= before["scrollHeight"]:
+                    stuck_attempts += 1
+                    if stuck_attempts >= 2:
+                        raise RuntimeError("Cuộn không di chuyển dù chưa tới đáy; giữ checkpoint để kiểm tra vùng cuộn.")
+                else:
+                    stuck_attempts = 0
+                print("   [SCROLL] Chưa tới đáy; tiếp tục cuộn, không tính là hết kết quả.")
 
+        print("   [SCROLL] 3 lượt chờ tại đáy không đổi danh sách; kiểm tra trang tiếp.")
         next_buttons = frame.locator(
             'button[aria-label="Next Page"]:visible, button[aria-label="Next page"]:visible, '
             'button[aria-label="Trang tiếp"]:visible, '
@@ -813,6 +909,9 @@ class TikTokBrowserAutomation:
             self._record_invitation_state(on_state_change, "ready", "awaiting_approval", error="Người dùng chưa duyệt gửi.")
             print(f"⏸ Chưa gửi Đợt {batch_index}; danh sách được giữ để chạy tiếp.")
             return False, invitation_name, 0
+        conflict_labels = self.page.get_by_text("Trùng lặp lời mời", exact=True)
+        if any(conflict_labels.nth(i).is_visible() for i in range(conflict_labels.count())):
+            raise RuntimeError("Còn cảnh báo Trùng lặp lời mời sau xác nhận; chưa bấm Gửi.")
         success_message = self.page.get_by_text("Đã gửi lời mời cộng tác!", exact=True)
         success_message.wait_for(state="hidden", timeout=3000)
         send_button = self.page.locator("button:has-text('Gửi')")
@@ -841,12 +940,12 @@ class TikTokBrowserAutomation:
         time.sleep(2)
 
         ##########################################################################
-        # 2. Tạo tên lời mời chuẩn dạng: BD_AUTO_[4 số đuôi ID SKU]-[NGÀY/THÁNG]_[ĐỢT] (VD: BD_AUTO_3257-07/11_1)[cite: 2, 3]
+        # 2. Tạo tên lời mời chuẩn dạng: BD_AUTOMATION_[4 số đuôi ID SKU]-[NGÀY/THÁNG]_[ĐỢT] (VD: BD_AUTO_3257-07/11_1)[cite: 2, 3]
         ##########################################################################
         sku_id = str(sku_info.get("sku_id", ""))
         suffix_4_digits = sku_id[-4:] if len(sku_id) >= 4 else sku_id
         today_str = datetime.datetime.now().strftime("%d/%m")
-        invitation_name = f"BD_AUTO_{suffix_4_digits}-{today_str}_{batch_index}"
+        invitation_name = f"BD_AUTOMATION_{suffix_4_digits}-{today_str}_{batch_index}"
         if attempt > 1:
             invitation_name += f"_R{attempt}"
         self._record_invitation_state(on_state_change, "draft", "configure_invitation", invitation_name=invitation_name)
@@ -1077,7 +1176,8 @@ class TikTokBrowserAutomation:
         print(f"\n👉 Đang thêm {len(creator_usernames)} nhà sáng tạo vào Đợt {batch_index}...")
         self._record_invitation_state(on_state_change, "draft", "add_creators")
         creator_header = page.locator("text=Chọn nhà sáng tạo").first
-        if creator_header.count() > 0:
+        search = page.get_by_placeholder("Tìm kiếm nhà sáng tạo theo tên người dùng hoặc ID người dùng")
+        if creator_header.count() > 0 and not search.is_visible():
             creator_header.evaluate("el => el.click()")
             time.sleep(1.0)
 
@@ -1176,8 +1276,48 @@ class TikTokBrowserAutomation:
             print(f"     ⚠️ Các creator không thêm được: {failed_creators}")
         return added_count
 
+    def _invitation_conflict_rows(self, creator_usernames):
+        expected = {str(name).strip().lstrip("@").lower() for name in creator_usernames}
+        search = self.page.get_by_placeholder("Tìm kiếm nhà sáng tạo theo tên người dùng hoặc ID người dùng")
+        region = search.locator("xpath=ancestor::*[.//table/thead//th[contains(.,'Nhà sáng tạo')]][1]")
+        if region.count() != 1:
+            raise RuntimeError("Không xác định được bảng creator để kiểm tra trùng lời mời.")
+        conflicts = {}
+        for row in region.locator("tbody tr:visible").all():
+            if row.get_by_text("Trùng lặp lời mời", exact=True).count() == 0:
+                continue
+            matches = [name for name in expected if row.get_by_text(
+                re.compile(rf"^@?{re.escape(name)}$", re.IGNORECASE)
+            ).count() == 1]
+            if len(matches) != 1 or matches[0] in conflicts:
+                raise RuntimeError("Không đọc được username duy nhất của dòng Trùng lặp lời mời; chưa gửi.")
+            name = matches[0]
+            identity = self.page.get_by_text(re.compile(rf"^@?{re.escape(name)}$", re.IGNORECASE))
+            stable_row = region.locator("tbody tr:visible").filter(has=identity)
+            if stable_row.count() != 1:
+                raise RuntimeError(f"Không xác định được dòng ổn định của {name}; chưa gửi.")
+            conflicts[name] = stable_row
+        print(f"   [CONFLICT] Kiểm tra đợt: {len(conflicts)} creator trùng: {list(conflicts)}")
+        return conflicts
+
+    def _remove_invitation_conflict(self, username, row):
+        button = row.locator('button:has(svg.alliance-icon-DeleteThin)')
+        if button.count() == 0:
+            button = row.get_by_role("button", name=re.compile(r"^(Xóa|Xoá|Delete|Remove)$", re.IGNORECASE))
+        if button.count() == 0:
+            button = row.locator(
+                '[aria-label="Xóa"], [aria-label="Delete"], '
+                'svg.arco-icon-delete, svg.arco-icon-trash, '
+                'svg[class*="icon-delete"], svg[class*="icon-trash"]'
+            )
+        if button.count() != 1:
+            raise RuntimeError(f"Chưa xác định được nút xóa duy nhất của {username}; cần DOM nút xóa, chưa gửi.")
+        button.click(timeout=5000)
+        row.wait_for(state="detached", timeout=5000)
+        print(f"   [CONFLICT] Đã xóa {username} khỏi bản nháp.")
+
     def create_target_invitation(self, sku_info, invite_content, creator_usernames, batch_index=1,
-                                 on_state_change=None, attempt=1):
+                                 on_state_change=None, attempt=1, on_creator_conflicts=None):
         """
         Thực hiện toàn bộ tạo lời mời cộng tác mục tiêu + thêm creator vào lời mời (Theo đợt tối đa 50 người)[cite: 2, 3]
         """
@@ -1192,6 +1332,32 @@ class TikTokBrowserAutomation:
             self._configure_invitation_product(sku_id, sku_info, on_state_change)
             self._configure_invitation_samples()
             failed_creators = self._add_invitation_creators(creator_usernames, batch_index, on_state_change)
+            if failed_creators:
+                raise RuntimeError(f"Chưa thêm được creator: {failed_creators}; chưa gửi.")
+            # Chờ validation TikTok sau khi thêm; kiểm tra lại trước nút Gửi.
+            for replacement_attempt in range(4):
+                self.page.wait_for_timeout(1500)
+                conflicts = self._invitation_conflict_rows(creator_usernames)
+                if not conflicts:
+                    break
+                self._record_invitation_state(on_state_change, "draft", "replace_creators")
+                if on_creator_conflicts is None or replacement_attempt == 3:
+                    raise RuntimeError("Còn creator trùng lời mời; giữ checkpoint, chưa gửi.")
+                original = list(creator_usernames)
+                replacement_names = on_creator_conflicts(list(conflicts))
+                normalized = lambda names: {str(name).strip().lstrip("@").lower() for name in names}
+                original_set, replacement_set = normalized(original), normalized(replacement_names)
+                if (len(replacement_names) != len(original) or len(replacement_set) != len(original)
+                        or original_set - set(conflicts) != replacement_set & original_set
+                        or set(conflicts) & replacement_set):
+                    raise RuntimeError("Danh sách thay thế không giữ đúng người hợp lệ; chưa gửi.")
+                for name, row in conflicts.items():
+                    self._remove_invitation_conflict(name, row)
+                additions = [name for name in replacement_names if str(name).strip().lstrip("@").lower() not in original_set]
+                failed_creators = self._add_invitation_creators(additions, batch_index, on_state_change)
+                creator_usernames = replacement_names
+                if failed_creators:
+                    raise RuntimeError(f"Không thêm được người thay thế: {failed_creators}; chưa gửi.")
             added_count = self._select_invitation_creators(
                 creator_usernames, batch_index, failed_creators, on_state_change,
             )
@@ -1211,6 +1377,8 @@ class TikTokBrowserAutomation:
                     f"thêm thất bại: {failed_creators}; chưa gửi."
                 )
             
+            if self._invitation_conflict_rows(creator_usernames):
+                raise RuntimeError("TikTok vẫn báo trùng lời mời sau cấu hình; chưa gửi.")
             self._record_invitation_state(on_state_change, "ready", "awaiting_approval")
             return self._send_target_invitation(invitation_name, added_count, batch_index, on_state_change)
 

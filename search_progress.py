@@ -65,6 +65,18 @@ class DailyProgress:
                 "day": day, "shop": shop, "sku_id": str(sku_id),
                 "selected": {}, "scanned": {}, "finished_keywords": [], "batches": [],
             }
+        self.data.setdefault("search_round", 1)
+        self.data.setdefault("keyword_progress", {})
+        self.data.setdefault("invitation_conflicts", {})
+
+    def update_keyword(self, keyword, **fields):
+        state = self.data["keyword_progress"].setdefault(keyword, {})
+        state.update(fields)
+        state["updated_at"] = datetime.datetime.now(
+            datetime.timezone(datetime.timedelta(hours=7))
+        ).isoformat(timespec="seconds")
+        self.save()
+        return state
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,12 +119,20 @@ class DailyProgress:
             if batch["status"] not in ("draft", "ready"):
                 continue
             names = batch["usernames"]
-            if names and len(names) == len(set(names)) and set(names) <= available:
+            if (names or batch.get("required_size")) and len(names) == len(set(names)) and set(names) <= available:
                 jobs.append(batch)
                 available.difference_update(names)
             else:
                 batch.update(status="superseded", error="Danh sách/tiêu chí/mục tiêu đã đổi; phân bổ lại người chưa gửi.")
         unassigned = [name for name in remaining if name in available]
+        for batch in jobs:
+            required = batch.get("required_size", len(batch["usernames"]))
+            additions = unassigned[:max(0, required - len(batch["usernames"]))]
+            batch["usernames"].extend(additions)
+            del unassigned[:len(additions)]
+            if len(batch["usernames"]) < required:
+                self.save()
+                raise RuntimeError("Đợt chưa đủ creator thay thế; giữ checkpoint, chưa gửi.")
         next_index = max((batch["index"] for batch in self.data["batches"]), default=0) + 1
         for offset in range(0, len(unassigned), batch_size):
             batch = {
