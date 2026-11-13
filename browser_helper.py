@@ -5,6 +5,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from urllib.parse import urlparse, parse_qs
 import time
 import diagnostics
+import interaction
 from config import SEARCH_PAGE_URL
 
 SEARCH_SEL = 'input[data-tid="m4b_input_search"]'
@@ -54,17 +55,20 @@ class TikTokBrowserAutomation:
     def wait_for_user_login(self):
         """Dừng chờ người dùng đăng nhập thủ công lần đầu"""
         print("\n" + "=" * 50)
-        input(">>> HÃY ĐĂNG NHẬP TÀI KHOẢN TRÊN TRÌNH DUYỆT.\n"
-              ">>> SAU KHI ĐĂNG NHẬP XONG VÀ VÀO ĐÚNG TRANG TÌM NHÀ SÁNG TẠO, BẤM ENTER...")
+        interaction.ask(">>> HÃY ĐĂNG NHẬP TÀI KHOẢN TRÊN TRÌNH DUYỆT.\n"
+                        ">>> SAU KHI ĐĂNG NHẬP XONG VÀ VÀO ĐÚNG TRANG TÌM NHÀ SÁNG TẠO, BẤM ENTER...",
+                        kind='continue')
         print("=" * 50 + "\n")
         time.sleep(3)
 
     def close(self):
         """Đóng trình duyệt"""
-        if self.browser_context:
-            self.browser_context.close()
-        if self.playwright:
-            self.playwright.stop()
+        try:
+            if self.browser_context:
+                self.browser_context.close()
+        finally:
+            if self.playwright:
+                self.playwright.stop()
 
     # ------------------------------------------------------------------ #
     # Tiện ích frame / phần tử
@@ -430,6 +434,7 @@ class TikTokBrowserAutomation:
         return False
     
     def _check_captcha(self, frame=None):
+        interaction.checkpoint()
         for surface in (self.page, frame):
             if surface is None:
                 continue
@@ -808,7 +813,7 @@ class TikTokBrowserAutomation:
             callback(dict(self.last_invitation_state))
 
     def _send_target_invitation(self, invitation_name, added_count, batch_index, on_state_change):
-        confirm = input(f"👉 Bạn có muốn GỬI lời mời Đợt {batch_index} này không? (y/n): ")
+        confirm = interaction.ask(f"👉 Bạn có muốn GỬI lời mời Đợt {batch_index} này không? (y/n): ", kind='confirm')
         if confirm.strip().lower() != "y":
             self._record_invitation_state(on_state_change, "ready", "awaiting_approval", error="Người dùng chưa duyệt gửi.")
             print(f"⏸ Chưa gửi Đợt {batch_index}; danh sách được giữ để chạy tiếp.")
@@ -1082,7 +1087,7 @@ class TikTokBrowserAutomation:
             time.sleep(1.0)
 
 
-                    # ==========================================
+        # ==========================================
         # GIAI ĐOẠN 1: Gõ tìm và đưa từng creator xuống bảng
         # ==========================================
         self._record_invitation_state(on_state_change, "draft", "set_creator_page_size")
@@ -1090,6 +1095,7 @@ class TikTokBrowserAutomation:
         self._record_invitation_state(on_state_change, "draft", "add_creators")
         failed_creators = []
         for username in creator_usernames:
+            interaction.checkpoint()
             username = str(username).strip()
             diagnostics.set_context(creator=username)
             search_creator = page.get_by_placeholder("Tìm kiếm nhà sáng tạo theo tên người dùng hoặc ID người dùng")
@@ -1259,6 +1265,7 @@ class TikTokBrowserAutomation:
         observed, settled = {}, 0
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
+            interaction.checkpoint()
             snapshot = content.locator("tbody tr.core-table-tr").evaluate_all("""rows => rows.map(row => {
                 const names = row.querySelectorAll('span.text-neutral-text1.text-body-m-medium');
                 const boxes = row.querySelectorAll('input[type="checkbox"]');
@@ -1372,7 +1379,7 @@ class TikTokBrowserAutomation:
         # 4. Bấm "Chia sẻ"
         share_btn = self._chat_recipient_popup(chat_page).get_by_role("button", name=re.compile(r"^\s*Chia sẻ\s*$"))
         share_btn.wait_for(state="visible", timeout=10000)
-        if input("Xác nhận GỬI qua chat cho các creator đang chọn? (y/n): ").strip().lower() != "y":
+        if interaction.ask("Xác nhận GỬI qua chat cho các creator đang chọn? (y/n): ", kind='confirm').strip().lower() != "y":
             print("Không gửi qua chat; giữ tab để kiểm tra.")
             return result
         # Read again after operator approval in case the popup selection changed.
@@ -1385,10 +1392,10 @@ class TikTokBrowserAutomation:
         # Popup đóng/networkidle không chứng minh hàng đợi gửi đã hoàn tất.
         print("   [+] Đã bấm Chia sẻ. Giữ tab chat mở, chưa xác nhận gửi đủ.")
         print("   Kiểm tra từng người nhận và các cảnh báo giới hạn/lỗi trên TikTok.")
-        completed = input(
+        completed = interaction.ask(
             f"Chỉ khi đã xác minh gửi đủ {len(selection['selected_usernames'])} người đang chọn, "
             "nhập 'DA GUI DU' để đóng tab "
-            "và tiếp tục. Nếu thiếu/chưa rõ, nhấn Enter để giữ tab và dừng: "
+            "và tiếp tục. Nếu thiếu/chưa rõ, nhấn Enter để giữ tab và dừng: ", kind='verify'
         ).strip()
         if completed != "DA GUI DU":
             print("   ⚠ Chưa xác nhận gửi đủ. Giữ tab chat; không tự gửi lại.")

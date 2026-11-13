@@ -118,7 +118,7 @@ class GoogleSheetManager:
         for row in rows[3:]:
             for cell in row:
                 cell = cell.strip()
-                print("=====", cell)
+                # print("=====", cell)
                 if cell and not cell.startswith("Cấp") and not re.match(r"^\d", cell):
                     # Chỉ lấy những chuỗi trông như username (không phải số, không phải "Cấp X")
                     norm = self.normalize_username(cell)

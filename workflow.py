@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import diagnostics
 import creator_rules
+import interaction
 from search_progress import DailyProgress, build_search_terms
 
 
@@ -11,6 +12,7 @@ class RunSources:
     english_keywords: dict
     existing: set
     invitations: dict
+    spreadsheet_id: str = ''
 
 
 class BookingWorkflow:
@@ -44,6 +46,7 @@ class BookingWorkflow:
         diagnostics.set_context(stage="checkpoint")
         if not progress.path.exists():
             print("   -> Checkpoint mới: số đã gửi DAILY chỉ tính các đợt được bản code này ghi nhận.")
+        self._verify_checkpoint_source(progress)
         if progress.blocking_batches:
             self._resume_sent_chats(progress)
         sent_today = len(progress.sent_usernames)
@@ -90,6 +93,7 @@ class BookingWorkflow:
 
         # Khôi phục người đã chọn nhưng chưa gửi, kể cả đã có trong LIST LƯU TẠM.
         for username in list(progress.pending_usernames):
+            interaction.checkpoint()
             creator = progress.data["selected"][username]
             valid, reasons = creator_rules.validate_creator(creator, sku)
             if not valid:
@@ -165,6 +169,7 @@ class BookingWorkflow:
         )
 
         for kw in search_terms:
+            interaction.checkpoint()
             if sku_count >= target:
                 break
             if any(done.casefold() == kw.casefold() for done in progress.data["finished_keywords"]):
@@ -176,6 +181,7 @@ class BookingWorkflow:
             creators = bot.iter_creators_for_keyword(kw, set(scanned))
             keyword_finished = True
             for c in creators:
+                interaction.checkpoint()
                 diagnostics.set_context(creator=c["username"])
                 norm = creator_rules.normalize_username(c["username"])
                 if not norm:
@@ -214,6 +220,29 @@ class BookingWorkflow:
 
         return sku_count, grand_total
 
+    def _verify_checkpoint_source(self, progress):
+        source = self.sources.spreadsheet_id
+        if not source:
+            return
+        previous = progress.data.get('spreadsheet_id')
+        if previous == source:
+            return
+        if previous:
+            raise RuntimeError(
+                f'Checkpoint thuộc Sheet ID {previous}, khác Sheet đang chọn {source}. '
+                'Không khôi phục hoặc ghi kết quả sang Sheet khác; giữ checkpoint để đối chiếu.'
+            )
+        if any(progress.data.get(key) for key in ('selected', 'scanned', 'batches', 'finished_keywords')):
+            answer = interaction.ask(
+                f'Checkpoint cũ chưa lưu nguồn Sheet: {progress.path}. '
+                f'Chỉ nếu đã đối chiếu và chắc chắn dữ liệu này thuộc Sheet ID {source}, '
+                "nhập 'DUNG NGUON' để khôi phục; để trống để dừng: ", kind='verify_source',
+            ).strip()
+            if answer != 'DUNG NGUON':
+                raise RuntimeError('Chưa xác nhận Sheet nguồn của checkpoint; không khôi phục hoặc gửi.')
+        progress.data['spreadsheet_id'] = source
+        progress.save()
+
     def send_batches(self, sku, progress, creators_for_this_sku):
         sheet_mgr, bot = self.sheet_mgr, self.bot
         product, target = sku["product"], sku["target"]
@@ -225,6 +254,7 @@ class BookingWorkflow:
             invite_content = invitation_templates.get(sku['sku_id'], "")
 
             for batch_state in creator_batches:
+                interaction.checkpoint()
                 batch_index = batch_state["index"]
                 diagnostics.set_context(batch=batch_index, keyword=None, creator=None, stage="target_navigation")
                 batch_creators = [progress.data["selected"][name]["username"] for name in batch_state["usernames"]]
@@ -320,6 +350,7 @@ class BookingWorkflow:
         diagnostics.set_context(stage="update_followup_history")
         batch_state["stage"] = "update_followup_history"
         progress.save()
+        interaction.checkpoint()
         sheet_mgr.update_followup_history(inv_name, chat_result["followup_count"], rate_limit)
         batch_state.update(status="completed", stage="done", error=None)
         progress.save()
@@ -331,6 +362,7 @@ class BookingWorkflow:
         batches = progress.blocking_batches
         # Do not resume any sends while another batch has an uncertain invitation result.
         for batch in batches:
+            interaction.checkpoint()
             if batch['status'] != 'sent' or batch.get('stage') not in ('chat', 'update_followup_history'):
                 raise RuntimeError(
                     f"Đợt {batch['index']} đang {batch['status']} ở bước {batch.get('stage', 'không rõ')}. "
@@ -350,17 +382,17 @@ class BookingWorkflow:
             if result.get('share_clicked') is True:
                 raise RuntimeError('Đã thao tác Chia sẻ nhưng chat chưa xác nhận; kiểm tra TikTok trước, không tự gửi lại.')
             if result.get('share_clicked') is not False:
-                answer = input(
+                answer = interaction.ask(
                     f"Đợt {batch['index']} ({name}) chưa lưu trạng thái chat. "
-                    "Chỉ nếu chắc chắn CHƯA bấm Chia sẻ, nhập 'CHUA CHIA SE' để tiếp tục; Enter để dừng: "
+                    "Chỉ nếu chắc chắn CHƯA bấm Chia sẻ, nhập 'CHUA CHIA SE' để tiếp tục; Enter để dừng: ", kind='verify_unsent'
                 ).strip()
                 if answer != 'CHUA CHIA SE':
                     raise RuntimeError('Chưa xác minh chat chưa gửi; giữ checkpoint, không tự gửi lại.')
             chat_url = result.get('chat_url')
             if not chat_url:
-                chat_url = input(
+                chat_url = interaction.ask(
                     f"Mở trang chat của đúng lời mời '{name}', dán URL có plan_id và shop_id "
-                    "(không tạo lời mời mới); Enter để dừng: "
+                    "(không tạo lời mời mới); Enter để dừng: ", kind='url'
                 ).strip()
             if not chat_url:
                 raise RuntimeError('Chưa có URL chat đúng lời mời; giữ checkpoint.')

@@ -29,7 +29,8 @@ class _ConsoleMirror:
         self.pending = ""
 
     def write(self, text):
-        result = self.stream.write(text)
+        result = self.stream.write(text) if self.stream is not None else len(text)
+        self.session.emit_output(text, self.level)
         self.pending += text
         while "\n" in self.pending:
             line, self.pending = self.pending.split("\n", 1)
@@ -38,7 +39,8 @@ class _ConsoleMirror:
         return result
 
     def flush(self):
-        self.stream.flush()
+        if self.stream is not None:
+            self.stream.flush()
         if self.pending:
             self.session.record(self.level, self.pending)
             self.pending = ""
@@ -48,7 +50,8 @@ class _ConsoleMirror:
 
 
 class RunSession:
-    def __init__(self, output_dir="outputs"):
+    def __init__(self, output_dir="outputs", on_output=None, on_context=None):
+        self.on_output, self.on_context = on_output, on_context
         self.output_dir = Path(output_dir)
         self.run_id = datetime.datetime.now(_timezone).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
         self.context = dict(shop="-", sku="-", batch="-", stage="startup", keyword="-", creator="-")
@@ -82,6 +85,20 @@ class RunSession:
             except Exception:
                 pass
 
+    def emit_output(self, text, level):
+        if self.on_output is not None:
+            try:
+                self.on_output(text, level)
+            except Exception as error:
+                self.warn(error)
+
+    def emit_context(self):
+        if self.on_context is not None:
+            try:
+                self.on_context(dict(self.context))
+            except Exception as error:
+                self.warn(error)
+
     def record(self, level, message, error=None):
         if self.handler is None:
             return
@@ -97,6 +114,7 @@ class RunSession:
         self.stdout = _ConsoleMirror(self.original_stdout, self, logging.INFO)
         self.stderr = _ConsoleMirror(self.original_stderr, self, logging.ERROR)
         sys.stdout, sys.stderr = self.stdout, self.stderr
+        self.emit_context()
         self.record(logging.INFO, f"Run started; log={self.log_path}")
         return self
 
@@ -175,6 +193,7 @@ def set_context(**fields):
         for key, value in fields.items():
             if key in _active.context:
                 _active.context[key] = "-" if value is None else value
+        _active.emit_context()
 
 
 def log_exception(message, error):

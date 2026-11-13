@@ -2,15 +2,19 @@ from sheet_helper import GoogleSheetManager
 from browser_helper import TikTokBrowserAutomation
 from workflow import BookingWorkflow, RunSources
 import diagnostics
+import interaction
 
-from config import CREDENTIALS_FILE, SPREADSHEET_URL
+from config import CREDENTIALS_FILE, SPREADSHEET_URL, SEARCH_PAGE_URL, resolve_spreadsheet_url, spreadsheet_id_from_url
 
-def main():
+def main(bot=None, spreadsheet_url=None):
+    reuse_browser = bot is not None
+    interaction.checkpoint()
     diagnostics.set_context(shop=None, sku=None, batch=None, keyword=None, creator=None, stage="load_sources")
     print("--- [TASK 1] KHỞI ĐỘNG HỆ THỐNG TỰ ĐỘNG ---")
 
     try:
-        sheet_mgr = GoogleSheetManager(CREDENTIALS_FILE, SPREADSHEET_URL)
+        sheet_url = resolve_spreadsheet_url(spreadsheet_url)
+        sheet_mgr = GoogleSheetManager(CREDENTIALS_FILE, sheet_url)
         skus = sheet_mgr.load_skus()
         keywords_by_product = sheet_mgr.load_keywords()
         english_keywords_by_product = sheet_mgr.load_keywords("LIST KEYWORD EN", optional=True)
@@ -23,14 +27,18 @@ def main():
     except Exception as e:
         diagnostics.log_exception("Không đọc được nguồn Google Sheet", e)
         print(f"Lỗi kết nối hoặc đọc Google Sheet: {e}")
-        return
+        return False
 
-    bot = TikTokBrowserAutomation()
+    bot = bot if reuse_browser else TikTokBrowserAutomation()
     grand_total = 0
 
     try:
         diagnostics.set_context(stage="browser_start")
-        bot.start_browser()
+        interaction.checkpoint()
+        if reuse_browser and bot.page is not None and not bot.page.is_closed():
+            bot.page.goto(SEARCH_PAGE_URL)
+        else:
+            bot.start_browser()
         diagnostics.set_context(stage="login")
         bot.wait_for_user_login()
         _, current_shop_name = bot.check_current_shop()
@@ -40,21 +48,25 @@ def main():
 
         if not current_shop_name: 
             print("   ❌ Không xác định được Shop đang đăng nhập. Dừng tool!")
-            return
+            return False
         print(f"\n🚀 Đang chạy automation cho Shop: {current_shop_name} (Tên Shop: {current_shop_name})")
 
         creator_search_url = bot.page.url
 
-        sources = RunSources(kw_lookup, en_kw_lookup, existing, invitation_templates)
+        sources = RunSources(kw_lookup, en_kw_lookup, existing, invitation_templates,
+                             spreadsheet_id=spreadsheet_id_from_url(sheet_url))
         workflow = BookingWorkflow(sheet_mgr, bot, current_shop_name, creator_search_url, sources)
         for sku in skus:
+            interaction.checkpoint()
             grand_total = workflow.process_sku(sku, grand_total)
 
         print(f"\n=== [HOÀN TẤT] Tổng {grand_total} creator mới ===")
+        return True
 
     except Exception as e:
         diagnostics.capture_error(bot.page, e)
         print(f"Đã xảy ra lỗi trong quá trình chạy: {e}")
+        return False
     # finally:
     #     bot.close()
 
