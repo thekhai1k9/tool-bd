@@ -14,12 +14,11 @@ def main():
         skus = sheet_mgr.load_skus()
         keywords_by_product = sheet_mgr.load_keywords()
         english_keywords_by_product = sheet_mgr.load_keywords("LIST KEYWORD EN", optional=True)
-        blacklist = sheet_mgr.load_blacklist()
         existing = sheet_mgr.load_existing_creators()
         kw_lookup = {k.strip().lower(): v for k, v in keywords_by_product.items()}
         en_kw_lookup = {k.strip().lower(): v for k, v in english_keywords_by_product.items()}
         print(f"-> {len(skus)} SKU, {len(keywords_by_product)} nhóm keyword, "
-              f"{len(blacklist)} blacklist, {len(existing)} creator đã lưu.")
+              f"{len(existing)} creator đã lưu.")
         print(f"-> LIST KEYWORD EN: {len(english_keywords_by_product)} nhóm sản phẩm.")
     except Exception as e:
         diagnostics.log_exception("Không đọc được nguồn Google Sheet", e)
@@ -46,7 +45,7 @@ def main():
 
         creator_search_url = bot.page.url
 
-        sources = RunSources(kw_lookup, en_kw_lookup, blacklist, existing, invitation_templates)
+        sources = RunSources(kw_lookup, en_kw_lookup, existing, invitation_templates)
         workflow = BookingWorkflow(sheet_mgr, bot, current_shop_name, creator_search_url, sources)
         for sku in skus:
             grand_total = workflow.process_sku(sku, grand_total)

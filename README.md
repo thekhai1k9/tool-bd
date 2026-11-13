@@ -34,6 +34,8 @@ python app.py
 - Keyword Việt, Anh từ Sheet, brand và các biến thể hiện có; có giới hạn dừng khi không có kết quả mới. Chưa triển khai vòng quét 100/200 creator hoặc quét vô hạn tới đủ DAILY.
 - Chỉ tạo lời mời khi đủ mục tiêu còn thiếu, chia tối đa 50 creator/đợt. Đặt bảng 50/trang rồi chọn checkbox tổng trên cùng trang.
 - Các tiêu chí followers, GMV, số món và cách loại trùng không thay đổi. Module rules tách ra không sửa cách parse hoặc các trường hợp biên hiện có.
+- LIST LƯU TẠM là nguồn Sheet duy nhất để chống trùng creator; người vừa lưu được bổ sung ngay vào tập chống trùng của lượt chạy. Creator không đạt tiêu chí chỉ lưu lý do loại trong checkpoint. Creator chờ gửi được khôi phục từ checkpoint dù đã lưu Sheet. Không cần tab BLACK LIST.
+- Checkpoint cũ có bản ghi loại theo quy tắc chống trùng trước đây sẽ được mở lại keyword tương ứng để kiểm tra lại riêng những creator đó theo LIST LƯU TẠM; giữ nguyên danh sách đã chọn và lịch sử gửi.
 - Chat vẫn dùng bước xác nhận của người vận hành. Follow-up vẫn được gán bằng số creator đã mời sau xác nhận, chưa phải số đo độc lập từ chat.
 - Sheet chỉ cache đối tượng tab để tránh lấy metadata lặp lại. Nội dung hàng/cột vẫn đọc mới; cách ghi từng creator và thứ tự lưu checkpoint giữ nguyên. Nếu đổi tên/xóa/tạo lại tab trong lúc chạy, khởi động lại hoặc gọi `clear_worksheet_cache()`.
 

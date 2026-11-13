@@ -108,12 +108,6 @@ class GoogleSheetManager:
                 result[product] = keywords
         return result
 
-    def load_blacklist(self):
-        """Đọc danh sách Blacklist để loại trừ"""
-        sheet = self._worksheet("BLACK LIST")
-        rows = sheet.get_all_values()
-        return {self.normalize_username(r[0]) for r in rows if r and r[0].strip()}
-
     def load_existing_creators(self):
         """Đọc LIST LƯU TẠM: quét TẤT CẢ các cột từ hàng 4 trở xuống để lấy tất cả username
         đã lưu (mỗi cột = 1 sản phẩm)."""

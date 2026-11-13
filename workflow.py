@@ -9,7 +9,6 @@ from search_progress import DailyProgress, build_search_terms
 class RunSources:
     keywords: dict
     english_keywords: dict
-    blacklist: set
     existing: set
     invitations: dict
 
@@ -28,7 +27,7 @@ class BookingWorkflow:
         shop_key = current_shop_name.strip().lower()
         creator_search_url = self.creator_search_url
         kw_lookup, en_kw_lookup = self.sources.keywords, self.sources.english_keywords
-        blacklist, existing = self.sources.blacklist, self.sources.existing
+        existing = self.sources.existing
         product = sku["product"]
         target = sku["target"]
         keywords = kw_lookup.get(product.strip().lower(), [])
@@ -75,12 +74,31 @@ class BookingWorkflow:
             progress.data.update(criteria=criteria, scanned={}, finished_keywords=[])
             progress.save()
 
+        # Recheck exclusions from the old combined duplicate rule, without resetting send history.
+        reopened_keywords = set()
+        for keyword, scanned in progress.data["scanned"].items():
+            legacy_names = [name for name, creator in scanned.items() if any(
+                reason.startswith("trùng ") and reason != "trùng LIST LƯU TẠM/lượt hiện tại"
+                for reason in creator.get("reasons", [])
+            )]
+            for name in legacy_names:
+                del scanned[name]
+            if legacy_names:
+                reopened_keywords.add(keyword.casefold())
+        if reopened_keywords:
+            progress.data["finished_keywords"] = [
+                keyword for keyword in progress.data["finished_keywords"]
+                if keyword.casefold() not in reopened_keywords
+            ]
+            progress.save()
+            print("   -> Kiểm tra lại creator bị loại theo quy tắc chống trùng cũ; giữ lịch sử gửi.")
+
         # Khôi phục người đã chọn nhưng chưa gửi, kể cả đã có trong LIST LƯU TẠM.
         for username in list(progress.pending_usernames):
             creator = progress.data["selected"][username]
             valid, reasons = creator_rules.validate_creator(creator, sku)
-            if username in blacklist or not valid:
-                print(f"   [-] Bỏ checkpoint {username}: blacklist hoặc {reasons}")
+            if not valid:
+                print(f"   [-] Bỏ checkpoint {username}: {reasons}")
                 del progress.data["selected"][username]
                 progress.save()
                 continue
@@ -142,7 +160,7 @@ class BookingWorkflow:
     def collect_creators(self, sku, progress, sent_today, keywords, english_keywords, grand_total):
         sheet_mgr, bot = self.sheet_mgr, self.bot
         product, target = sku["product"], sku["target"]
-        blacklist, existing = self.sources.blacklist, self.sources.existing
+        existing = self.sources.existing
         sku_count = sent_today + len(progress.pending_usernames)
         search_terms = build_search_terms(keywords, product, english_keywords)
         print(
@@ -168,8 +186,8 @@ class BookingWorkflow:
                 if not norm:
                     continue
                 ok, reasons = creator_rules.validate_creator(c, sku)
-                if norm in blacklist or norm in existing:
-                    reasons.append("trùng blacklist/LIST LƯU TẠM/lượt hiện tại")
+                if norm in existing:
+                    reasons.append("trùng LIST LƯU TẠM/lượt hiện tại")
                 if c.get("already_invited"):
                     reasons.append("TikTok hiển thị đã mời hoặc không thể mời")
                 scanned[norm] = {**c, "reasons": reasons}
