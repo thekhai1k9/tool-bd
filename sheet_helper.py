@@ -229,6 +229,10 @@ class GoogleSheetManager:
             print(f"   ⚠ Không thể đọc tab 'NỘI DUNG LỜI MỜI': {e}")
             return {}
 
+    def load_followup_templates(self):
+        from followup import parse_templates
+        return parse_templates(self._worksheet("TIN NHẮN FOLLOW UP").get_all_values())
+
     def log_invitation_history(self, invitation_name, total_creators, total_follow):
         """Ghi một dòng vào tab 'THEO DÕI LỜI MỜI' đúng theo cột A-G."""
         try:
@@ -255,7 +259,7 @@ class GoogleSheetManager:
             print(f"     ⚠️ Không ghi được lịch sử lên Google Sheet: {e}")
             raise
 
-    def update_followup_history(self, invitation_name, total_follow, rate_limit_usernames=()):
+    def update_followup_history(self, invitation_name, total_follow, rate_limit_usernames=(), followup_day=None):
         """Update only the three named follow-up columns of one matching invitation."""
         ws = self._worksheet("THEO DÕI LỜI MỜI")
         headers = [" ".join(value.split()).upper() for value in ws.row_values(1)]
@@ -279,6 +283,10 @@ class GoogleSheetManager:
         if any(not name or not re.fullmatch(r"[\w.]+", name) for name in usernames) or len(set(usernames)) != len(usernames):
             raise ValueError("Danh sách rate limit có username không hợp lệ hoặc trùng")
         today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime("%d/%m/%Y")
+        if followup_day is not None:
+            if followup_day:
+                datetime.datetime.strptime(followup_day, "%d/%m/%Y")
+            today = followup_day
         ws.batch_update(
             data=[{"range": gspread.utils.rowcol_to_a1(row, columns[title]), "values": [[value]]}
                   for title, value in zip(titles[1:], (total_follow, today, "/".join(usernames)))],

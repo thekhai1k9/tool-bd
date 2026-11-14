@@ -76,7 +76,8 @@ def main(profile=None):
 
         creator_search_url = bot.page.url
 
-        sources = RunSources(kw_lookup, en_kw_lookup, existing, invitation_templates)
+        sources = RunSources(kw_lookup, en_kw_lookup, existing, invitation_templates,
+                             sheet_mgr.load_followup_templates())
         workflow = BookingWorkflow(sheet_mgr, bot, current_shop_name, creator_search_url, sources)
         for sku in skus:
             grand_total = workflow.process_sku(sku, grand_total)

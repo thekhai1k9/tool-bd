@@ -1498,7 +1498,7 @@ class TikTokBrowserAutomation:
             raise RuntimeError('Trang chat chuyển sang shop hoặc lời mời khác; chưa gửi.')
         return chat_page
 
-    def share_invitation_via_chat(self, creator_usernames, on_result=None, chat_url=None):
+    def share_invitation_via_chat(self, creator_usernames, on_result=None, chat_url=None, keep_open=False):
         """Share only the existing selection; persist counts before/after manual confirmation."""
         page = self.page
         diagnostics.set_context(stage="chat", creator=None, keyword=None)
@@ -1516,7 +1516,7 @@ class TikTokBrowserAutomation:
         print(f"   [+] Trang tin nhắn: {chat_page.url}")
         result = {"selected_usernames": [], "rate_limit_usernames": [],
                   "expected_count": len(creator_usernames), "confirmed": False,
-                  "share_clicked": False, "followup_count": 0, "chat_url": chat_page.url}
+                  "share_clicked": False, "shared_count": 0, "chat_url": chat_page.url}
 
         def save_result():
             if on_result is not None:
@@ -1531,10 +1531,13 @@ class TikTokBrowserAutomation:
         result.update(selection)
         save_result()
         if not selection["selected_usernames"]:
-            print("   -> Không có creator khả dụng; không bấm Chia sẻ. Ghi 0 follow-up và danh sách rate limit.")
+            print("   -> Không có creator khả dụng để chia sẻ; tiếp tục kiểm tra riêng từng người nếu giữ tab.")
             result["confirmed"] = True
             save_result()
-            chat_page.close()
+            if keep_open:
+                self._chat_recipient_popup(chat_page).get_by_role("button", name="Hủy", exact=True).click()
+            else:
+                chat_page.close()
             return result
 
         # 4. Bấm "Chia sẻ"
@@ -1555,14 +1558,15 @@ class TikTokBrowserAutomation:
         print("   Kiểm tra từng người nhận và các cảnh báo giới hạn/lỗi trên TikTok.")
         completed = input(
             f"Chỉ khi đã xác minh gửi đủ {len(selection['selected_usernames'])} người đang chọn, "
-            "nhập 'DA GUI DU' để đóng tab "
+            "nhập 'DA GUI DU' để tiếp tục "
             "và tiếp tục. Nếu thiếu/chưa rõ, nhấn Enter để giữ tab và dừng: "
         ).strip()
         if completed != "DA GUI DU":
             print("   ⚠ Chưa xác nhận gửi đủ. Giữ tab chat; không tự gửi lại.")
             return result
-        result.update(confirmed=True, followup_count=len(creator_usernames) - len(selection["rate_limit_usernames"]))
+        result.update(confirmed=True, shared_count=len(creator_usernames) - len(selection["rate_limit_usernames"]))
         save_result()
-        chat_page.close()
-        print("   ✓ Người dùng đã xác minh gửi đủ; đã đóng tab chat.")
+        if not keep_open:
+            chat_page.close()
+        print("   ✓ Người dùng đã xác minh chia sẻ đủ; tiếp tục xử lý.")
         return result

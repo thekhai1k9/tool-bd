@@ -1,5 +1,6 @@
 """Per-SKU orchestration; browser, Sheet and checkpoint policies stay in their adapters."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import followup
 from itertools import islice
 import diagnostics
 import creator_rules
@@ -27,6 +28,7 @@ class RunSources:
     english_keywords: dict
     existing: set
     invitations: dict
+    followups: dict = field(default_factory=dict)
 
 def choose_buckets(minimum, buckets):
     if minimum is None:
@@ -64,6 +66,9 @@ class BookingWorkflow:
         if not is_shop_match:
             print(f"-> Bỏ qua SKU '{product}': Shop đang đăng nhập '{current_shop_name}' không trùng với shop trong list CMS SKU: '{sku.get('shop')}'")
             return grand_total
+
+        # Kiểm tra mẫu trước khi tìm/gửi; từng người sẽ dùng snapshot trong checkpoint.
+        followup.render_message(self.sources.followups.get(str(sku["sku_id"])), {"username": "creator"})
 
         progress = DailyProgress(current_shop_name, sku["sku_id"])
         diagnostics.set_context(stage="checkpoint")
@@ -437,6 +442,20 @@ class BookingWorkflow:
     def _finish_batch_chat(self, progress, batch_state, batch_creators, chat_url=None, cached_result=None):
         sheet_mgr, bot = self.sheet_mgr, self.bot
         inv_name, batch_index = batch_state["invitation_name"], batch_state["index"]
+        recipients = batch_state.get("followup", {}).get("recipients")
+        if recipients is None:
+            template = self.sources.followups.get(progress.data["sku_id"])
+            recipients = {
+                creator_rules.normalize_username(name): {
+                    "status": "pending", "message_snapshot": followup.render_message(
+                        template, progress.data["selected"][creator_rules.normalize_username(name)],
+                    ),
+                } for name in batch_creators
+            }
+            batch_state["followup"] = {"version": 1, "recipients": recipients}
+            progress.save()
+        if set(recipients) != {creator_rules.normalize_username(name) for name in batch_creators}:
+            raise RuntimeError("Danh sách follow-up không khớp đợt; chưa gửi.")
         try:
             batch_state["stage"] = "chat"
             diagnostics.set_context(stage="chat")
@@ -448,9 +467,9 @@ class BookingWorkflow:
             if cached_result is not None:
                 chat_result = cached_result
             elif chat_url is not None:
-                chat_result = bot.share_invitation_via_chat(batch_creators, on_result=save_chat_result, chat_url=chat_url)
+                chat_result = bot.share_invitation_via_chat(batch_creators, on_result=save_chat_result, chat_url=chat_url, keep_open=True)
             else:
-                chat_result = bot.share_invitation_via_chat(batch_creators, on_result=save_chat_result)
+                chat_result = bot.share_invitation_via_chat(batch_creators, on_result=save_chat_result, keep_open=True)
             save_chat_result(chat_result)
             if chat_result.get("confirmed") is not True:
                 raise RuntimeError("Chat chưa xác nhận gửi đủ; giữ trạng thái để kiểm tra.")
@@ -459,7 +478,7 @@ class BookingWorkflow:
             rate_limit = chat_result["rate_limit_usernames"]
             if (len(set(selected)) != len(selected) or len(set(rate_limit)) != len(rate_limit)
                     or set(selected) & set(rate_limit) or set(selected) | set(rate_limit) != expected
-                    or chat_result["followup_count"] != len(selected)):
+                    or chat_result.get("shared_count", chat_result.get("followup_count")) != len(selected)):
                 raise RuntimeError("Kết quả chat không khớp danh sách đợt; chưa cập nhật Sheet.")
         except Exception as e:
             diagnostics.capture_error(bot.page, e)
@@ -467,21 +486,46 @@ class BookingWorkflow:
             progress.save()
             print(f"   ⚠️ Không chia sẻ được lời mời '{inv_name}' qua chat: {e}")
             raise
-        diagnostics.set_context(stage="update_followup_history")
+        from followup_chat import FollowupChat
+        batch_state["stage"] = "followup"
+        progress.save()
+        chat_page = bot._open_saved_chat(chat_result["chat_url"])
+        sender = FollowupChat(bot, chat_page)
+
+        def save_followup():
+            progress.save()
+            count, day, limited = followup.summarize(recipients)
+            sheet_mgr.update_followup_history(inv_name, count, limited, followup_day=day)
+            print(f"   [FOLLOWUP] Đợt {batch_index}: {count}/{len(recipients)} đã gửi; giới hạn {len(limited)}.")
+
+        # Đồng bộ lại Sheet trước khi tiếp tục nếu lần trước ghi Sheet bị lỗi.
+        save_followup()
+        try:
+            for username, state in recipients.items():
+                diagnostics.set_context(stage="followup", creator=username)
+                sender.send_one(username, state, save_followup)
+        except BaseException as error:
+            batch_state["error"] = str(error)
+            progress.save()
+            diagnostics.capture_error(chat_page, error)
+            raise
+        if any(state["status"] not in ("sent", "rate_limited") for state in recipients.values()):
+            raise RuntimeError("Còn người nhận chưa xử lý xong; giữ tab chat và checkpoint.")
         batch_state["stage"] = "update_followup_history"
         progress.save()
-        sheet_mgr.update_followup_history(inv_name, chat_result["followup_count"], rate_limit)
+        save_followup()
         batch_state.update(status="completed", stage="done", error=None)
         progress.save()
         diagnostics.set_context(stage="done")
-        print(f"   ✓ Follow-up '{inv_name}': {chat_result['followup_count']} creator; "
-              f"rate limit: {len(rate_limit)} (theo lựa chọn chat và xác nhận người dùng).")
+        chat_page.close()
+        count, _, limited = followup.summarize(recipients)
+        print(f"   ✓ Follow-up '{inv_name}': {count} tin riêng đã xác minh; rate limit: {len(limited)}.")
 
     def _resume_sent_chats(self, progress):
         batches = progress.blocking_batches
         # Do not resume any sends while another batch has an uncertain invitation result.
         for batch in batches:
-            if batch['status'] != 'sent' or batch.get('stage') not in ('chat', 'update_followup_history'):
+            if batch['status'] != 'sent' or batch.get('stage') not in ('chat', 'followup', 'update_followup_history'):
                 raise RuntimeError(
                     f"Đợt {batch['index']} đang {batch['status']} ở bước {batch.get('stage', 'không rõ')}. "
                     f"Kiểm tra lịch sử trước; không tự gửi lại. Checkpoint: {progress.path}"

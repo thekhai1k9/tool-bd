@@ -16,6 +16,19 @@ python app.py
 
 Đặt khóa service account tại `credentials.json` và cấp quyền Sheet cho tài khoản đó. URL Sheet và trang tìm creator nằm trong `config.py`; mặc định giữ nguyên URL trước refactor. Đăng nhập đúng shop trên trình duyệt được mở và làm theo hướng dẫn console.
 
+## Profile đăng nhập riêng cho từng shop
+
+```powershell
+python app.py --profile rizin
+python app.py --profile lunave
+```
+
+Mỗi tên dùng một thư mục riêng: `user_data/rizin/`, `user_data/lunave/`. Lần đầu đăng nhập thủ công vào tài khoản/shop tương ứng; lần sau chọn lại cùng tên để dùng lại phiên đó. Tên profile chỉ là nhãn thư mục, không tự đăng nhập hoặc ép chọn shop. Script vẫn xác định shop thật từ URL TikTok và đối chiếu CMS SKU.
+
+Không truyền `--profile` thì dùng `user_data/` như trước. Code không xóa, sao chép hoặc chuyển cookie từ profile cũ sang profile mới. Tên profile được chuẩn hóa chữ thường, gồm chữ không dấu, số, `-` hoặc `_`, tối đa 64 ký tự; không nhận đường dẫn hoặc tên thiết bị Windows. Đóng trình duyệt/lượt chạy cũ trước khi chạy lại cùng profile. Hiện vẫn vận hành lần lượt một shop mỗi lần.
+
+Profile chỉ tách phiên trình duyệt; checkpoint vẫn theo ngày/shop/SKU và LIST LƯU TẠM vẫn chống trùng chung. Profile RIZIN/LUNAVÉ mới không cần xóa checkpoint hoặc dữ liệu đăng nhập cũ.
+
 ## Cấu trúc code
 
 | File | Trách nhiệm |
@@ -36,10 +49,20 @@ python app.py
 - Các tiêu chí followers, GMV, số món và cách loại trùng không thay đổi. Module rules tách ra không sửa cách parse hoặc các trường hợp biên hiện có.
 - LIST LƯU TẠM là nguồn Sheet duy nhất để chống trùng creator; người vừa lưu được bổ sung ngay vào tập chống trùng của lượt chạy. Creator không đạt tiêu chí chỉ lưu lý do loại trong checkpoint. Creator chờ gửi được khôi phục từ checkpoint dù đã lưu Sheet. Không cần tab BLACK LIST.
 - Checkpoint cũ có bản ghi loại theo quy tắc chống trùng trước đây sẽ được mở lại keyword tương ứng để kiểm tra lại riêng những creator đó theo LIST LƯU TẠM; giữ nguyên danh sách đã chọn và lịch sử gửi.
-- Chat vẫn dùng bước xác nhận của người vận hành. Follow-up vẫn được gán bằng số creator đã mời sau xác nhận, chưa phải số đo độc lập từ chat.
+- Chia sẻ lời mời qua chat vẫn dùng xác nhận `DA GUI DU`. Sau đó giữ tab chat và gửi riêng mẫu từ `TIN NHẮN FOLLOW UP` cho từng người của đợt. Số chia sẻ lưu riêng (`chat_result.shared_count`), không dùng làm số follow-up.
 - Sheet chỉ cache đối tượng tab để tránh lấy metadata lặp lại. Nội dung hàng/cột vẫn đọc mới; cách ghi từng creator và thứ tự lưu checkpoint giữ nguyên. Nếu đổi tên/xóa/tạo lại tab trong lúc chạy, khởi động lại hoặc gọi `clear_worksheet_cache()`.
 
 ## Checkpoint và debug
+
+### Tin nhắn follow-up riêng
+
+Tab `TIN NHẮN FOLLOW UP`: hàng 2 chứa SKU (nhiều ID ngăn bằng `;`), hàng 3 là mẫu. `{Tên Creator}` được thay bằng tên đã thu thập, thiếu tên thì dùng username. Mẫu thiếu, xung đột hoặc vượt 2000 ký tự UTF-16 sẽ chặn luồng; không lấy mẫu SKU khác.
+
+Mỗi đợt lưu `followup.recipients` với nội dung snapshot và trạng thái từng username. Người đã `sent` hoặc `rate_limited` được bỏ qua khi chạy lại. `sending`/`unknown` chặn gửi tiếp để đối chiếu thủ công, không tự thử gửi lại. Đợt `completed` từ bản code cũ không tự chạy lại follow-up.
+
+Chỉ ghi `sent` khi có tin mới khớp nội dung và DOM trạng thái xác nhận thành công. DOM trạng thái TikTok thực tế chưa được cung cấp đầy đủ: nếu không khớp, script dừng sau tối đa 30 giây, giữ tab, ghi bằng chứng vào checkpoint và log `[FOLLOWUP]`. Cần đối chiếu trạng thái thực tế trước khi điều chỉnh selector; không coi bong bóng tin hoặc khung nhập rỗng là thành công.
+
+`FOLLOW-UP ĐÃ GỬI` đếm tin riêng đã xác minh; `NGÀY FOLLOW-UP` là ngày thành công gần nhất (rỗng nếu chưa có); `RATE LIMIT TIN NHẮN CREATOR` nối username bằng `/`. Không tìm/mở được người nhận hoặc không xác định khả năng gửi trước click được phân loại giới hạn theo quy ước vận hành. Kết quả chưa rõ sau click được giữ riêng là `unknown` và dừng đợt.
 
 Giữ `outputs/checkpoints/` khi chạy lại. Checkpoint tách theo ngày/shop/SKU; ngày mới tự dùng file mới. Creator chờ gửi được khôi phục. Đợt lỗi trước gửi ở `draft` có thể cấu hình lại; trạng thái `sending`, `sent` chưa hoàn tất hoặc chưa rõ kết quả phải kiểm tra lịch sử/chat trước khi chạy lại để tránh gửi trùng.
 
